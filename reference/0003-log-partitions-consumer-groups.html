@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: Log Partitions and Consumer Groups</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0003</div>
+        <h1>Log Partitions and Consumer Groups</h1>
+        <p class="lede">A compact checklist for designing Kafka-style consumption with local ordering, scalable workers, explicit offset commits, and replayable recovery.</p>
+      </header>
+
+      <section>
+        <h2>The Recurring Shape</h2>
+        <div class="flow">
+          <div><strong>Key</strong>Choose the smallest correctness boundary that needs order.</div>
+          <div><strong>Partition</strong>Related records append to one ordered partition.</div>
+          <div><strong>Group</strong>Workers divide partitions for one logical subscriber.</div>
+          <div><strong>Offset</strong>Commit progress only after the effect is safe.</div>
+          <div><strong>Replay</strong>Reprocess retained facts to rebuild derived state.</div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Design Checklist</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Question</th>
+              <th>Good answer</th>
+              <th>Common trap</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>What needs ordering?</td>
+              <td>Order by aggregate, SKU, account, merchant, or another correctness boundary.</td>
+              <td>Demanding global order when only local order matters.</td>
+            </tr>
+            <tr>
+              <td>How much parallelism exists?</td>
+              <td>At most one active consumer per partition inside one group.</td>
+              <td>Adding consumers after partitions run out and expecting more throughput.</td>
+            </tr>
+            <tr>
+              <td>When is work consumed?</td>
+              <td>After the handler's effect is durably safe and the offset is committed.</td>
+              <td>Auto-committing records before side effects complete.</td>
+            </tr>
+            <tr>
+              <td>Can the handler run twice?</td>
+              <td>Yes. Use event IDs, versions, conditional writes, or recomputation.</td>
+              <td>Assuming a broker prevents all duplicate effects.</td>
+            </tr>
+            <tr>
+              <td>Can you rebuild?</td>
+              <td>Retain events, preserve schema compatibility, and replay into a controlled target.</td>
+              <td>Discovering retention or schema drift only during an incident.</td>
+            </tr>
+            <tr>
+              <td>What proves freshness?</td>
+              <td>Per-partition lag, event age, processing latency, and served projection age.</td>
+              <td>Looking only at average lag across the whole group.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Vocabulary</h2>
+        <p><strong>Partition:</strong> one ordered append-only slice of a topic.</p>
+        <p><strong>Offset:</strong> a position in one partition, used to track consumer progress.</p>
+        <p><strong>Consumer group:</strong> one logical subscriber made of one or more consumer processes.</p>
+        <p><strong>Rebalance:</strong> reassignment of partitions after membership, topic, or partition changes.</p>
+        <p><strong>Lag:</strong> the distance between produced records and consumed records for a partition or group.</p>
+        <p><strong>Hot partition:</strong> one partition receives or processes much more work than the others.</p>
+        <p><strong>Replay:</strong> reading retained events again to rebuild, repair, or backfill derived state.</p>
+      </section>
+
+      <section>
+        <h2>Useful Questions</h2>
+        <ol>
+          <li>What key keeps the facts that must be ordered on the same partition?</li>
+          <li>What happens if this key becomes hot?</li>
+          <li>How many partitions limit active consumers in one group?</li>
+          <li>Does the consumer commit before or after the side effect?</li>
+          <li>Can the side effect tolerate duplicate processing?</li>
+          <li>Can old events still be decoded and replayed?</li>
+          <li>Which metric shows user-visible freshness, not just broker health?</li>
+        </ol>
+      </section>
+    </main>
+  </body>
+</html>

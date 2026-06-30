@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0003: Partitions, Consumer Groups, and Replay</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0003</div>
+        <h1>Partitions, Consumer Groups, and Replay</h1>
+        <p class="lede">The third mental model: a Kafka-style log scales because ordering is local, consumption is coordinated, and progress is remembered as offsets.</p>
+        <p class="compact">Mission link: this is the practical core behind resume bullets about Kafka pipelines, Flink inputs, inventory sync, Redis materialization rebuilds, DLQs, lag, and replay-based recovery.</p>
+      </header>
+
+      <section>
+        <h2>Where This Fits</h2>
+        <p><a href="0002-safe-writes-idempotency-and-outbox.html">Lesson 0002</a> ended with committed outbox events reaching Kafka. This lesson starts at that point: the event is now in a topic, and the system must consume it at scale without lying about order, progress, or recovery.</p>
+        <p>Keep <a href="../reference/0003-log-partitions-consumer-groups.html">Reference 0003: Log Partitions and Consumer Groups</a> nearby. It is the compressed checklist for this lesson.</p>
+      </section>
+
+      <section>
+        <h2>Concise Answers From Lesson 0002</h2>
+        <ol>
+          <li><strong>Inventory reserve key:</strong> one retryable reservation intent, usually scoped to caller, order, SKU, quantity, and operation.</li>
+          <li><strong>Uniqueness constraint:</strong> <code>UNIQUE(caller_id, key)</code> prevents two claims of the same caller-supplied idempotency key.</li>
+          <li><strong>Publish then commit is unsafe:</strong> downstream consumers may observe an event for state that later rolls back.</li>
+          <li><strong>Duplicate outbox publish:</strong> consumers should dedupe by event ID or make their writes naturally idempotent.</li>
+          <li><strong>Subscription ordering key:</strong> usually the subscription or aggregate ID, because lifecycle transitions for one aggregate must stay ordered.</li>
+          <li><strong>Slow publish signal:</strong> outbox depth, oldest unpublished row age, publish error rate, and consumer lag after publish.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>The Big Idea</h2>
+        <p>A log is not a single global timeline. In production it is usually split into partitions. Each partition is an ordered append-only sequence, and each record receives an offset inside that partition. Kafka's consumer documentation treats the offset as the consumer's position in that partition, while its design docs frame the log as the replayable storage structure behind Kafka's throughput and recovery model.</p>
+        <p>The key move is accepting <strong>local order</strong> instead of demanding <strong>global order</strong>. If all events for <code>subscription_sub_123</code> go to the same partition, that subscription's lifecycle can be processed in order. Events for unrelated subscriptions can be processed in parallel on other partitions.</p>
+        <div class="map">
+          <p><strong>Log consumption shape:</strong></p>
+          <pre><code>outbox relay publishes event
+  -> topic chooses partition from key
+  -> record gets partition offset
+  -> consumer group owns partitions
+  -> handler applies side effect
+  -> consumer commits offset
+  -> lag and event age reveal freshness</code></pre>
+        </div>
+      </section>
+
+      <section>
+        <h2>Partitions: The Unit of Order and Scale</h2>
+        <p>A topic can have many partitions. A producer typically assigns a record to a partition using the record key, although custom partitioners and keyless records can change that behavior. The design decision is not "Kafka or not Kafka." The real decision is: <strong>which facts must be ordered with which other facts?</strong></p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Key choice</th>
+              <th>What it preserves</th>
+              <th>What it costs</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>subscription_id</code></td>
+              <td>Lifecycle order for one subscription.</td>
+              <td>Merchant aggregates must combine many independent ordered streams.</td>
+            </tr>
+            <tr>
+              <td><code>merchant_id</code></td>
+              <td>Order for all billing events of one merchant.</td>
+              <td>Large merchants can become hot partitions.</td>
+            </tr>
+            <tr>
+              <td><code>sku_id</code></td>
+              <td>Inventory updates for one SKU stay ordered.</td>
+              <td>High-volume SKUs can dominate one partition.</td>
+            </tr>
+            <tr>
+              <td>random key</td>
+              <td>Load spreads evenly.</td>
+              <td>Related events can arrive out of order.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>There is no free global order. Global order usually means one partition or expensive coordination. One partition is simple, but it caps consumer parallelism and makes one slow partition everyone's problem. Good systems choose the smallest ordering scope that preserves correctness.</p>
+      </section>
+
+      <section>
+        <h2>Consumer Groups: One Logical Subscriber, Many Processes</h2>
+        <p>Kafka consumer groups let many processes act as one logical subscriber. The official consumer docs describe the important constraint: within a group, each partition is assigned to exactly one consumer. That is what prevents two workers in the same group from racing over the same partition stream.</p>
+        <div class="flow">
+          <div><strong>Topic</strong><code>billing_events</code> has 12 partitions.</div>
+          <div><strong>Group</strong><code>mrr-projector</code> has 4 consumers.</div>
+          <div><strong>Assign</strong>Each consumer receives about 3 partitions.</div>
+          <div><strong>Scale</strong>Adding consumers helps until partitions run out.</div>
+          <div><strong>Rebalance</strong>Failure or membership change moves partitions.</div>
+        </div>
+        <p>Two different consumer groups can both read the same topic without duplicating stored data. For example, <code>mrr-projector</code>, <code>search-indexer</code>, and <code>audit-archiver</code> can each consume all billing events for different purposes. Inside each group, the partitions are divided among that group's workers.</p>
+        <p>This gives you both queue-like and pub/sub-like behavior. One group spreads work like a queue. Multiple groups independently subscribe like pub/sub.</p>
+      </section>
+
+      <section>
+        <h2>Offsets: What Recovery Actually Means</h2>
+        <p>A consumer has a current position and a committed position. The current position moves as records are returned by <code>poll</code>. The committed position is the durable recovery point the consumer group can resume from after restart. This distinction is where many production bugs hide.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Commit timing</th>
+              <th>Failure window</th>
+              <th>Delivery shape</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Commit before processing</td>
+              <td>Crash after commit can skip work forever.</td>
+              <td>At-most-once, usually unsafe for business facts.</td>
+            </tr>
+            <tr>
+              <td>Process, then commit</td>
+              <td>Crash after side effect but before commit can replay work.</td>
+              <td>At-least-once, requires idempotent effects.</td>
+            </tr>
+            <tr>
+              <td>Atomic sink and offset transaction</td>
+              <td>Only works when all participating systems share the transaction.</td>
+              <td>Exactly-once for that bounded boundary.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>The common production default is process first, commit after. That means duplicates are normal after failure. The answer is not wishful thinking about "exactly once"; it is idempotent handlers, event IDs, versions, conditional writes, and reconciliation.</p>
+      </section>
+
+      <section>
+        <h2>Scenario: Rebuilding MRR Materialization</h2>
+        <p>Suppose the MRR projection in Redis is wrong because a bug undercounted discounts. A log-based architecture gives you a repair path: fix the projection code, start from an older offset or a fresh consumer group, replay billing events, and rebuild the derived state.</p>
+        <p>Replay is powerful because the log keeps facts separate from the derived read model. But replay is only safe when old events are still retained, schemas can still be decoded, side effects are controlled, and the projection is deterministic enough to rebuild the same state from the same facts.</p>
+        <div class="principle">
+          <p><strong>Replay checklist:</strong></p>
+          <ol>
+            <li>Choose whether to replay into a shadow store or overwrite the live projection.</li>
+            <li>Start from a known offset, timestamp, or empty materialized view.</li>
+            <li>Disable irreversible side effects such as emails, external payments, and partner webhooks.</li>
+            <li>Apply events idempotently using event IDs, aggregate versions, or full recomputation.</li>
+            <li>Compare rebuilt aggregates with database truth, old projection, and sampled merchant totals.</li>
+            <li>Cut over only after lag, freshness, and correctness checks are acceptable.</li>
+          </ol>
+        </div>
+      </section>
+
+      <section>
+        <h2>Lag, Hot Partitions, and Backpressure</h2>
+        <p>Consumer lag is the distance between produced records and consumed records for a group, usually inspected per partition. It is useful, but it is not the whole story. A group can have low total lag while one hot partition is far behind, or low record lag while old events are stuck behind a few expensive messages.</p>
+        <p>For production systems, pair lag with event age, processing latency, retry counts, DLQ growth, and downstream saturation. The user-visible question is not "is Kafka healthy?" It is "how old is the data being served, and which partition, key, dependency, or deployment is making it stale?"</p>
+      </section>
+
+      <section>
+        <h2>How to Defend the Resume Bullet</h2>
+        <p>Suppose someone asks: "How did the inventory pipeline handle millions of events per day?" A strong answer names the partitioning and recovery model, not just the broker.</p>
+        <div class="principle">
+          <p><strong>Strong answer shape:</strong></p>
+          <ol>
+            <li>We keyed high-throughput inventory facts by the smallest correctness boundary, usually SKU or fulfillment-center SKU.</li>
+            <li>Kafka partitions gave parallelism while preserving per-key order where allocation correctness depended on it.</li>
+            <li>Consumer groups let each downstream workflow scale independently without duplicating stored topic data.</li>
+            <li>Consumers processed records before committing offsets, so duplicate handling was part of the design.</li>
+            <li>Slow or malformed records used retry, backoff, DLQ routing, and reconciliation instead of blocking the whole pipeline forever.</li>
+            <li>Operations watched per-partition lag, event age, hot keys, DLQ count, retry rate, and downstream write latency.</li>
+          </ol>
+        </div>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. What is the main guarantee of keying subscription events by subscription ID?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Related lifecycle events for one subscription land on the same ordered partition.">Order per subscription</button>
+            <button data-correct="false" data-why="">Order per database</button>
+            <button data-correct="false" data-why="">Order per cluster</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. What does one consumer group represent?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">One storage broker</button>
+            <button data-correct="true" data-why="Correct. A group is one logical subscriber made of one or more processes.">One logical subscriber</button>
+            <button data-correct="false" data-why="">One global partition</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. Why commit offsets after processing?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">Avoid all duplicates</button>
+            <button data-correct="false" data-why="">Increase topic count</button>
+            <button data-correct="true" data-why="Correct. A crash should replay uncommitted work rather than silently skip it.">Avoid skipped work</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. What is the usual cause of one partition lagging far behind?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. A hot key or expensive record can overload one ordered partition while others stay current.">Hot ordered key</button>
+            <button data-correct="false" data-why="">Perfect load spread</button>
+            <button data-correct="false" data-why="">Empty retry queue</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required. These are the checks that show whether you can reason about log consumption:</p>
+        <ol>
+          <li>For subscription lifecycle events, why is global ordering usually unnecessary?</li>
+          <li>If a topic has 12 partitions and one consumer group has 20 consumers, how many consumers can actively read that topic?</li>
+          <li>What can happen if a consumer commits an offset before updating Redis?</li>
+          <li>What can happen if a consumer updates Redis and crashes before committing the offset?</li>
+          <li>How would you detect a hot partition in an MRR pipeline?</li>
+          <li>When replaying old events, which side effects must be disabled or guarded?</li>
+        </ol>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. Useful debugging questions here are: "What is the key?", "Which partition is behind?", "What offset committed?", "Can this side effect run twice?", and "Can we replay without harming users?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://kafka.apache.org/43/design/design/">Apache Kafka Design Documentation</a></li>
+          <li><a href="https://kafka.apache.org/43/design/design/#message-delivery-semantics">Apache Kafka Design: Message Delivery Semantics</a></li>
+          <li><a href="https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html">Apache KafkaConsumer API Documentation</a></li>
+          <li><a href="https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying">Jay Kreps, "The Log"</a></li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
