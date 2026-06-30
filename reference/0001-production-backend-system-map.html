@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: Production Backend System Map</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0001</div>
+        <h1>Production Backend System Map</h1>
+        <p class="lede">A compact map for reasoning about backend systems across companies and tools.</p>
+      </header>
+
+      <section>
+        <h2>The Recurring Shape</h2>
+        <div class="flow">
+          <div><strong>Ingress</strong>Validate request, authenticate caller, assign idempotency key, create trace context.</div>
+          <div><strong>Durable fact</strong>Commit the business event or transaction to a database, log, or outbox.</div>
+          <div><strong>Async work</strong>Fan out to consumers, workers, stream processors, and integrations.</div>
+          <div><strong>Serving state</strong>Build queryable projections, caches, indexes, and read models.</div>
+          <div><strong>Operations</strong>Observe latency, errors, saturation, lag, correctness, and recovery behavior.</div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Core Problems</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Problem</th>
+              <th>Standard approaches</th>
+              <th>Main tradeoff</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Accept traffic safely</td>
+              <td>Load balancers, rate limits, deadlines, backpressure, autoscaling</td>
+              <td>Protecting the system can reject or delay valid work.</td>
+            </tr>
+            <tr>
+              <td>Remember facts durably</td>
+              <td>Relational database, append-only log, outbox, replicated storage</td>
+              <td>Stronger durability and consistency usually add latency and coordination.</td>
+            </tr>
+            <tr>
+              <td>Decouple producers and consumers</td>
+              <td>Queues, logs, pub/sub, workflow engines</td>
+              <td>Decoupling absorbs spikes but introduces lag, retries, and duplicate handling.</td>
+            </tr>
+            <tr>
+              <td>Serve reads quickly</td>
+              <td>Caches, materialized views, denormalized tables, search indexes</td>
+              <td>Fast reads often mean stale or duplicated state that must be reconciled.</td>
+            </tr>
+            <tr>
+              <td>Survive failure</td>
+              <td>Retries, idempotency, DLQs, checkpoints, replication, reconciliation</td>
+              <td>Recovery mechanisms can create duplicate effects or hide correctness bugs.</td>
+            </tr>
+            <tr>
+              <td>Debug production</td>
+              <td>Logs, metrics, traces, exemplars, runbooks, SLOs</td>
+              <td>More telemetry costs money and attention; poor telemetry creates blind spots.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Vocabulary</h2>
+        <p><strong>Event:</strong> a recorded fact that something happened, such as <code>subscription_canceled</code>.</p>
+        <p><strong>Command:</strong> a request to do something, such as <code>cancel_subscription</code>.</p>
+        <p><strong>Log:</strong> an ordered append-only sequence of records, often partitioned for scale.</p>
+        <p><strong>Queue:</strong> a work-distribution structure where messages are usually consumed by one worker group.</p>
+        <p><strong>Materialized view:</strong> precomputed read state derived from source facts.</p>
+        <p><strong>Idempotency:</strong> making repeated attempts produce the same externally visible result.</p>
+        <p><strong>Backpressure:</strong> slowing or rejecting upstream work when downstream capacity is constrained.</p>
+        <p><strong>Lag:</strong> the distance between produced work and processed work.</p>
+        <p><strong>Reconciliation:</strong> comparing derived state with source-of-truth state and repairing divergence.</p>
+      </section>
+    </main>
+  </body>
+</html>

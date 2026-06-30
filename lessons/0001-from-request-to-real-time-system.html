@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0001: From Request to Real-Time System</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0001</div>
+        <h1>From a Request to a Real-Time Distributed System</h1>
+        <p class="lede">The first mental model: a serious backend system is not just an API and a database. It is a chain of decisions about facts, time, state, failure, and operations.</p>
+        <p class="compact">Mission link: this is the base pattern behind resume bullets about high-throughput APIs, event-driven pipelines, Redis materialization, stream processing, retries, reconciliation, and observability.</p>
+      </header>
+
+      <section>
+        <h2>The Big Picture</h2>
+        <p>Most production backend systems are built around one tension: users want simple fast operations, while the business needs durable correctness under traffic, failure, and change.</p>
+        <p>At small scale, you can often write request logic like this:</p>
+        <pre><code>request -> validate -> update database -> return response</code></pre>
+        <p>At production scale, that shape breaks down. One request may need to update billing state, notify other services, refresh analytics, trigger emails, update search, emit audit history, and expose fresh read models. Doing all of that synchronously makes the request slow and fragile. Doing all of it asynchronously makes correctness harder.</p>
+        <p>The industry response is to separate <strong>accepting facts</strong> from <strong>reacting to facts</strong>.</p>
+        <div class="map">
+          <p><strong>Production pattern:</strong></p>
+          <pre><code>request
+  -> validate command
+  -> commit durable fact
+  -> publish event
+  -> process event stream
+  -> update serving state
+  -> observe lag, errors, latency, correctness</code></pre>
+        </div>
+        <p>For a compact version of this shape, keep <a href="../reference/0001-production-backend-system-map.html">Reference 0001: Production Backend System Map</a> open while studying this lesson.</p>
+      </section>
+
+      <section>
+        <h2>First Principles</h2>
+        <h3>1. A request is not a fact yet</h3>
+        <p>A request is an attempt. It can time out, be retried, fail validation, race with another request, or arrive twice. A production system needs a moment where the attempted command becomes a durable business fact.</p>
+        <p>Example: <code>POST /subscriptions/{id}/cancel</code> is a command. <code>subscription_canceled</code> is a fact. Confusing these creates bugs: downstream systems should usually react to facts, not intentions.</p>
+
+        <h3>2. The database is not the only useful memory</h3>
+        <p>A relational database is excellent for durable source-of-truth state, constraints, and transactional updates. But the fastest way to answer a high-volume query may be a cache, a denormalized table, a search index, or a stream-built materialized view.</p>
+        <p>This is why a resume bullet might say "built a Redis materialization layer." Redis is not magic. The deeper idea is: precompute the read shape that the API needs, keep it close to the request path, and accept the burden of keeping it fresh and correct.</p>
+
+        <h3>3. A log turns time into an engineering tool</h3>
+        <p>An append-only log records events in order within a partition. Systems such as Kafka, Pulsar, Kinesis, and Google Pub/Sub all give engineers a way to decouple producers from consumers and replay work. The log lets you ask: "What happened, in what order, and can I reprocess it?"</p>
+        <p>Jay Kreps's article on <a href="https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying">the log as a unifying abstraction</a> is the primary reading for this lesson. Kafka's own <a href="https://kafka.apache.org/documentation/">documentation</a> is the canonical tool reference.</p>
+
+        <h3>4. Stream processing is controlled forgetting</h3>
+        <p>A stream processor turns event history into current derived state. It cannot remember everything forever, so it groups by key, keeps state, windows time, checkpoints progress, and defines recovery behavior. Flink, Beam, Spark Structured Streaming, Kafka Streams, and Materialize all make different tradeoffs around these ideas.</p>
+        <p>Apache Flink's <a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/stateful-stream-processing/">stateful stream processing docs</a> are the primary source for state and checkpoints.</p>
+
+        <h3>5. Observability is part of the design, not decoration</h3>
+        <p>In a distributed system, the failure is rarely "the system is down." More often, one dependency is slow, one partition is lagging, one consumer is retrying poison messages, one cache key is hot, or one deployment changed a payload contract. Observability is how engineers make invisible distributed behavior inspectable.</p>
+        <p>The Google SRE chapter on <a href="https://sre.google/sre-book/monitoring-distributed-systems/">monitoring distributed systems</a> and the <a href="https://opentelemetry.io/docs/">OpenTelemetry docs</a> are the sources to return to here.</p>
+      </section>
+
+      <section>
+        <h2>One Production Scenario</h2>
+        <p>Imagine a billing platform needs real-time monthly recurring revenue and churn metrics for many merchants. A simple batch job computes metrics once a day, but product and operations teams now need updates in under 30 seconds.</p>
+        <p>The naive answer is "query the database more often." That usually fails because billing state is complex, queries are expensive, and repeated aggregation over many accounts creates load on the source-of-truth database. The production answer is to treat billing changes as a stream of facts and maintain a derived read model.</p>
+
+        <div class="flow">
+          <div><strong>API</strong>Subscription changes enter through controlled commands.</div>
+          <div><strong>Fact</strong>Billing lifecycle events are committed durably.</div>
+          <div><strong>Log</strong>Events are appended to partitioned streams.</div>
+          <div><strong>Processor</strong>Operators update per-merchant metrics.</div>
+          <div><strong>Serving</strong>Redis or another low-latency store serves reads.</div>
+        </div>
+
+        <h3>What the experienced engineer is actually doing</h3>
+        <ul>
+          <li>Choosing the source of truth for business facts.</li>
+          <li>Defining event schemas and compatibility rules.</li>
+          <li>Partitioning events so ordering is preserved where it matters.</li>
+          <li>Maintaining keyed state for aggregates such as active subscriptions, MRR, and churn.</li>
+          <li>Checkpointing stream progress so failures can resume without corrupting state.</li>
+          <li>Serving precomputed state through a fast read path.</li>
+          <li>Measuring freshness, lag, correctness, latency, and error rate.</li>
+          <li>Building repair paths for missed, duplicated, late, or malformed events.</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2>Design Decisions and Tradeoffs</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Decision</th>
+              <th>Common options</th>
+              <th>Tradeoff</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Where is truth?</td>
+              <td>Database row, event log, outbox table, ledger</td>
+              <td>Database-first is familiar and transactional. Log-first improves replay and integration but requires stronger event discipline.</td>
+            </tr>
+            <tr>
+              <td>How do events leave the service?</td>
+              <td>Direct publish, transactional outbox, CDC, database triggers</td>
+              <td>Direct publish is simple but can lose events around transaction boundaries. Outbox and CDC are more reliable but add moving parts.</td>
+            </tr>
+            <tr>
+              <td>How is work distributed?</td>
+              <td>Queue, partitioned log, pub/sub, workflow engine</td>
+              <td>Queues are good for task distribution. Logs are good for replayable ordered histories. Workflow engines are good for long-lived orchestrated state.</td>
+            </tr>
+            <tr>
+              <td>How are reads made fast?</td>
+              <td>Cache-aside, write-through cache, materialized view, denormalized table</td>
+              <td>Caches are easy to add but can be stale. Materialized views are intentional and scalable but require repair and freshness monitoring.</td>
+            </tr>
+            <tr>
+              <td>What happens on failure?</td>
+              <td>Retry, backoff, DLQ, skip, stop-the-world, reconciliation</td>
+              <td>Retries help transient failures but amplify load. DLQs preserve bad messages but require ownership. Reconciliation repairs drift but may be expensive.</td>
+            </tr>
+            <tr>
+              <td>How fresh must state be?</td>
+              <td>Strong read-after-write, bounded staleness, eventual consistency</td>
+              <td>Stronger freshness usually costs coordination, latency, and availability. Bounded staleness is often enough for analytics and dashboards.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>How to Defend the Resume Bullet</h2>
+        <p>Suppose someone asks: "How did you get MRR and churn metrics under 30 seconds?" A weak answer names tools. A strong answer explains the system pressure and the tradeoffs.</p>
+        <div class="principle">
+          <p><strong>Strong answer shape:</strong></p>
+          <ol>
+            <li>Start with the user-visible problem: daily batch metrics were too stale for operations.</li>
+            <li>Explain the source facts: subscription lifecycle and invoice/payment events.</li>
+            <li>Explain why synchronous computation was rejected: expensive, fragile, and hard to scale under read load.</li>
+            <li>Explain the architecture: durable event stream, keyed stream processor, checkpointed state, Redis materialized read model.</li>
+            <li>Explain correctness hazards: duplicates, out-of-order events, late events, schema evolution, replay, and reconciliation.</li>
+            <li>Explain operations: consumer lag, processing latency, Redis hit rate, P95 API latency, DLQ count, checkpoint failures, and data freshness SLO.</li>
+          </ol>
+        </div>
+        <p>The point is not to pretend every company uses Kafka, Flink, and Redis. The point is to show that you understand why an engineer reaches for a durable log, a stream processor, and a serving projection.</p>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. Why not compute every metric inside the user request?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">Because Redis fixes all metrics.</button>
+            <button data-correct="true" data-why="Correct. Synchronous heavy work couples user latency to downstream compute and failure.">Because heavy work blocks requests.</button>
+            <button data-correct="false" data-why="">Because databases cannot aggregate metrics.</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. What is the deeper idea behind Kafka in this design?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">It outperforms every database always.</button>
+            <button data-correct="true" data-why="Correct. The durable replayable log decouples producers and consumers while preserving useful order.">It stores replayable ordered facts.</button>
+            <button data-correct="false" data-why="">It removes duplicate events automatically.</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. What is the cost of a Redis materialized view?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">It prevents every stale read.</button>
+            <button data-correct="false" data-why="">It replaces all schema design.</button>
+            <button data-correct="true" data-why="Correct. You gain fast reads but must manage freshness, drift, rebuilds, and repair.">It creates state needing repair.</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. Which signal best reveals stream freshness?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">Total lines of backend code.</button>
+            <button data-correct="true" data-why="Correct. Lag and end-to-end age show whether produced facts have reached serving state.">Consumer lag plus event age.</button>
+            <button data-correct="false" data-why="">Average commits by each developer.</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required, but these are the questions that reveal whether you own the material:</p>
+        <ol>
+          <li>For a subscription cancellation, what is the command and what is the durable fact?</li>
+          <li>What ordering guarantee do you need for billing lifecycle events: global order, merchant order, subscription order, or no order? Why?</li>
+          <li>If the stream processor crashes after updating Redis but before committing its checkpoint, what can happen after restart?</li>
+          <li>How would you detect that Redis has drifted from the source of truth?</li>
+          <li>When would you choose a queue instead of a replayable log?</li>
+          <li>What metric would page an engineer: API P95 latency, consumer lag, DLQ count, freshness age, or all of them under different SLOs?</li>
+        </ol>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. The fastest path is to interrogate the system: "What fails?", "What is the source of truth?", "What can be retried?", "What can be replayed?", and "What does the user observe?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying">Jay Kreps, "The Log"</a></li>
+          <li><a href="https://kafka.apache.org/documentation/">Apache Kafka Documentation</a></li>
+          <li><a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/stateful-stream-processing/">Apache Flink: Stateful Stream Processing</a></li>
+          <li><a href="https://sre.google/sre-book/monitoring-distributed-systems/">Google SRE Book: Monitoring Distributed Systems</a></li>
+          <li><a href="https://opentelemetry.io/docs/">OpenTelemetry Documentation</a></li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
