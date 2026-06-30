@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: Observability and Debugging Checklist</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0006</div>
+        <h1>Observability and Debugging Checklist</h1>
+        <p class="lede">A compact checklist for instrumenting and debugging backend systems across APIs, logs, stream processors, projections, caches, and user-visible contracts.</p>
+      </header>
+
+      <section>
+        <h2>The Recurring Shape</h2>
+        <div class="flow">
+          <div><strong>Symptom</strong>Name what the user saw: slow, failed, stale, or wrong.</div>
+          <div><strong>Signal</strong>Use metrics, traces, logs, and checks for different questions.</div>
+          <div><strong>Context</strong>Carry IDs across services, queues, events, and storage.</div>
+          <div><strong>Narrow</strong>Find where expected behavior first became bad behavior.</div>
+          <div><strong>Mitigate</strong>Reduce user impact before perfect root cause.</div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Design Checklist</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Question</th>
+              <th>Good answer</th>
+              <th>Common trap</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>What pages a human?</td>
+              <td>User-visible latency, errors, stale data, wrong data, or imminent saturation.</td>
+              <td>Paging on every internal metric anomaly regardless of user impact.</td>
+            </tr>
+            <tr>
+              <td>What are the four golden signals?</td>
+              <td>Latency, traffic, errors, and saturation, measured at the service boundary.</td>
+              <td>Watching only CPU and assuming users are fine.</td>
+            </tr>
+            <tr>
+              <td>What do metrics answer?</td>
+              <td>How often, how slow, how full, how old, and how many.</td>
+              <td>Depending on averages while tail latency or hot keys hurt users.</td>
+            </tr>
+            <tr>
+              <td>What do traces answer?</td>
+              <td>Where one request or operation spent time and crossed boundaries.</td>
+              <td>Losing the path when work becomes asynchronous.</td>
+            </tr>
+            <tr>
+              <td>What do logs answer?</td>
+              <td>Which discrete event happened, with searchable structured fields.</td>
+              <td>Logging prose without stable IDs or versions.</td>
+            </tr>
+            <tr>
+              <td>Which context is propagated?</td>
+              <td>Trace ID, span ID, request ID, event ID, tenant ID, and safe domain IDs.</td>
+              <td>Passing PII or secrets as baggage or log fields.</td>
+            </tr>
+            <tr>
+              <td>How do you debug?</td>
+              <td>Pick one affected request or event and narrow the path boundary by boundary.</td>
+              <td>Opening many dashboards and searching for correlations without a hypothesis.</td>
+            </tr>
+            <tr>
+              <td>What proves correctness?</td>
+              <td>Domain checks compare served state with source truth and freshness budgets.</td>
+              <td>Treating HTTP 200 as proof that the answer was correct.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Vocabulary</h2>
+        <p><strong>Monitoring:</strong> collecting and displaying quantitative data to understand system behavior and alert on important problems.</p>
+        <p><strong>Observability:</strong> the ability to inspect telemetry and infer how a system produced an outcome.</p>
+        <p><strong>Metric:</strong> a runtime measurement, often aggregated over time, such as latency, request count, lag, or cache hit rate.</p>
+        <p><strong>Trace:</strong> the causal path of a request or operation through services and components.</p>
+        <p><strong>Span:</strong> one timed unit of work inside a trace, such as an HTTP handler, database query, produce operation, or consumer update.</p>
+        <p><strong>Log:</strong> a timestamped event record; structured logs use stable fields and types.</p>
+        <p><strong>Context propagation:</strong> carrying correlation context across process and network boundaries so telemetry can be joined.</p>
+        <p><strong>Symptom:</strong> what users or callers experience, such as slow, failed, stale, or wrong responses.</p>
+        <p><strong>Cause:</strong> the internal condition that explains a symptom, such as DB saturation, cache eviction, lag, or a bad deploy.</p>
+        <p><strong>Domain check:</strong> a correctness check tied to business truth, such as projection MRR versus source-of-truth MRR.</p>
+      </section>
+
+      <section>
+        <h2>Useful Questions</h2>
+        <ol>
+          <li>What did the user experience, and over what time window?</li>
+          <li>Which concrete request, trace, merchant, event, or projection row proves the problem?</li>
+          <li>Is this a latency, traffic, error, saturation, freshness, or correctness issue?</li>
+          <li>Which signal answers the next question: metric, trace, log, or domain check?</li>
+          <li>Where does trace context stop propagating?</li>
+          <li>Which boundary first turns good input into bad output?</li>
+          <li>What changed recently: deploy, config, load shape, data distribution, or dependency behavior?</li>
+          <li>What can be mitigated safely before root cause is complete?</li>
+          <li>What evidence would prove the same failure cannot recur silently?</li>
+        </ol>
+      </section>
+    </main>
+  </body>
+</html>
