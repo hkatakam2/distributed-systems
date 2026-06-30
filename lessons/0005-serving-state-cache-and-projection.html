@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0005: Serving State, Cache, and Projection</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0005</div>
+        <h1>Serving State: Projection Tables, Redis, and Staleness Contracts</h1>
+        <p class="lede">The fifth mental model: fast read paths are built from deliberately stale copies. The engineering skill is to say which copy is authoritative, which copy is expendable, how stale it may be, and how you prove it is healthy.</p>
+        <p class="compact">Mission link: this is the practical layer behind dashboard APIs, Redis-backed materialized views, PostgreSQL read models, cache hit rates, backfills, and production claims about low-latency reads.</p>
+      </header>
+
+      <section>
+        <h2>Where This Fits</h2>
+        <p><a href="0004-stateful-stream-processing.html">Lesson 0004</a> explained how a stream processor turns replayable facts into state. This lesson starts at the serving boundary: how does an API read that derived state quickly without pretending every copy is source truth?</p>
+        <p>Keep <a href="../reference/0005-serving-state-cache-and-projection.html">Reference 0005: Serving State, Cache, and Projection Checklist</a> nearby. It is the compressed checklist for this lesson.</p>
+      </section>
+
+      <section>
+        <h2>Concise Answers From Lesson 0004</h2>
+        <ol>
+          <li><strong>Subscription then merchant:</strong> key by subscription first to dedupe, order lifecycle changes, and compute a delta; key by merchant second to aggregate all deltas for one dashboard owner.</li>
+          <li><strong>Per-subscription state:</strong> store the last version, status, plan, quantity, price, and event ID; avoid storing unbounded event history inside the stream job.</li>
+          <li><strong>Processing vs event time:</strong> processing time is acceptable when wall-clock worker behavior is the product behavior; event time is required when the business fact's timestamp determines the result.</li>
+          <li><strong>Watermark delay:</strong> it trades freshness for tolerance of late and out-of-order events.</li>
+          <li><strong>Redis write twice:</strong> checkpoint recovery restores internal state and source position, but an external sink write may have already happened before the failed checkpoint completed.</li>
+          <li><strong>Freshness metrics:</strong> distinguish Kafka lag and event age from watermark lag, window age, projection update age, and reconciliation drift.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>The Big Idea</h2>
+        <p>A production read path is often a chain of copies. The billing database owns subscription truth. Kafka owns replayable facts. A stream job owns derived computation. A PostgreSQL projection table or materialized view owns query-shaped serving rows. Redis owns hot, expendable copies for low-latency reads.</p>
+        <p>The key word is <strong>owns</strong>. Each layer owns a different job. When teams get into trouble, they usually blur those jobs: a cache becomes the only place a value exists, a projection has no rebuild path, or a dashboard says "real time" without an age metric.</p>
+        <div class="map">
+          <p><strong>Serving-state shape:</strong></p>
+          <pre><code>request write
+  -> source-of-truth database transaction
+  -> outbox event
+  -> Kafka topic
+  -> stream processor
+  -> projection table or materialized view
+  -> Redis cache for hot reads
+  -> dashboard API with freshness metadata</code></pre>
+        </div>
+        <p>PostgreSQL's materialized view docs describe stored query results that can be refreshed from their defining query, with the important caveat that the stored result may not be current. Redis's cache docs frame cache entries as copies of persistent data that can be evicted and recached. Those two ideas are the heart of this lesson: <strong>derived state is useful because it is not the source, but it must be honest about that fact.</strong></p>
+      </section>
+
+      <section>
+        <h2>Scenario: Merchant Dashboard Reads</h2>
+        <p>Suppose the product needs a merchant dashboard that loads in under 150 ms and shows current MRR, active subscriptions, failed payments, and usage spikes. Computing that directly from normalized billing tables on every request would be slow, expensive, and easy to overload during traffic spikes.</p>
+        <p>A stronger design separates truth, projection, and cache:</p>
+        <div class="flow">
+          <div><strong>Truth</strong><code>subscriptions</code>, <code>invoices</code>, and committed billing events.</div>
+          <div><strong>Compute</strong>Stream job turns subscription facts into merchant-level metrics.</div>
+          <div><strong>Project</strong><code>merchant_dashboard_summary</code> stores query-shaped rows.</div>
+          <div><strong>Cache</strong><code>dash:{merchant_id}</code> stores hot JSON with TTL.</div>
+          <div><strong>Serve</strong>API returns data plus <code>as_of</code> and freshness status.</div>
+        </div>
+        <p>The dashboard API is now fast because it reads one shaped object, not dozens of source tables. But correctness is preserved because the shaped object is still derived. If it looks wrong, you can trace back to source facts and rebuild it.</p>
+      </section>
+
+      <section>
+        <h2>Three Serving-State Shapes</h2>
+        <p>Do not reduce everything to "use Redis." Redis is a tool inside a serving strategy. The strategy usually combines durable projections and volatile caches.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Shape</th>
+              <th>Use when</th>
+              <th>Production contract</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Projection table</td>
+              <td>The app needs durable, query-shaped rows maintained incrementally.</td>
+              <td>Upserts are idempotent, versioned, indexed, observable, and rebuildable.</td>
+            </tr>
+            <tr>
+              <td>PostgreSQL materialized view</td>
+              <td>A stored query result can be refreshed periodically from its definition.</td>
+              <td>Readers accept refresh lag; refresh cost and locking behavior are understood.</td>
+            </tr>
+            <tr>
+              <td>Redis cache</td>
+              <td>Hot reads need lower latency or the backing store needs load relief.</td>
+              <td>Values are expendable; misses, expiry, eviction, and Redis failure are planned.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>PostgreSQL lets you refresh a materialized view, and the <code>CONCURRENTLY</code> option can avoid locking out concurrent selects when its requirements are met. That is useful, but it is still a refresh model. A projection table maintained by stream events is a different model: it changes incrementally as facts arrive.</p>
+      </section>
+
+      <section>
+        <h2>Projection Tables: Durable Derived State</h2>
+        <p>A projection table is not just a denormalized table. It is a contract: this row answers this read path, was derived from these source facts, and can be corrected or rebuilt.</p>
+        <div class="principle">
+          <p><strong>Minimal projection row:</strong></p>
+          <pre><code>merchant_dashboard_summary
+  merchant_id          primary key
+  current_mrr_cents    integer
+  active_subscriptions integer
+  failed_payment_count integer
+  source_version       bigint
+  as_of_event_time     timestamp
+  updated_at           timestamp</code></pre>
+        </div>
+        <p>The version fields matter. If a replayed old event tries to write <code>source_version = 41</code> after the projection already has <code>source_version = 43</code>, the update should be rejected or ignored. Without a guard, replay can move the dashboard backward.</p>
+        <p>A projection table should have an answer for four questions: What source facts produced this row? What version or timestamp prevents stale overwrites? How can this row be rebuilt? How do we detect drift from source truth?</p>
+      </section>
+
+      <section>
+        <h2>Redis: Volatile Acceleration</h2>
+        <p>Redis is commonly useful because memory access and simple data structures make hot reads fast. The danger is forgetting the word <em>cache</em>. A cache should usually be safe to lose. Redis's eviction docs explicitly discuss removing keys when memory limits are reached, and its <code>INFO</code> stats include <code>keyspace_hits</code>, <code>keyspace_misses</code>, and <code>evicted_keys</code> for checking cache behavior.</p>
+        <p>A simple cache-aside read path looks like this:</p>
+        <div class="map">
+          <pre><code>GET dash:{merchant_id} from Redis
+if hit:
+  return cached JSON
+if miss:
+  read merchant_dashboard_summary from PostgreSQL
+  SET dash:{merchant_id} JSON EX 30
+  return JSON</code></pre>
+        </div>
+        <p>The <code>EXPIRE</code> command sets a timeout after which a key is deleted. TTL gives you a maximum stale duration if the value is not actively invalidated sooner. TTL is not a correctness proof by itself. It is a bounded-risk tool.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Choice</th>
+              <th>What it buys</th>
+              <th>What it costs</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Short TTL</td>
+              <td>Less stale data after missed invalidations.</td>
+              <td>More misses and more backing-store load.</td>
+            </tr>
+            <tr>
+              <td>Long TTL</td>
+              <td>Higher hit rate and lower backing-store load.</td>
+              <td>Stale data lasts longer after source changes.</td>
+            </tr>
+            <tr>
+              <td>Event invalidation</td>
+              <td>Values can be removed or updated soon after a fact changes.</td>
+              <td>The invalidation path itself can fail or arrive out of order.</td>
+            </tr>
+            <tr>
+              <td>Versioned value</td>
+              <td>Older writers cannot overwrite newer derived state.</td>
+              <td>Every writer and reader must preserve the version contract.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Staleness Is a Product Contract</h2>
+        <p>Instead of saying "real time," name the contract. A merchant dashboard might be allowed to show MRR that is up to 30 seconds old. A checkout authorization screen may require a fresh source read. A fraud decision may use a stale feature cache if the model was designed for that staleness.</p>
+        <p>The contract should be visible in both code and telemetry:</p>
+        <div class="principle">
+          <ol>
+            <li><strong>Freshness budget:</strong> maximum age the product accepts, such as 30 seconds.</li>
+            <li><strong>Served timestamp:</strong> include <code>as_of_event_time</code> or <code>projection_updated_at</code>.</li>
+            <li><strong>Fallback behavior:</strong> decide whether to serve stale, bypass cache, read source, or return degraded status.</li>
+            <li><strong>Alert threshold:</strong> alert on user-visible freshness breach, not merely one delayed internal job.</li>
+          </ol>
+        </div>
+        <p>Google's SRE guidance is useful here because serving-state health is still service health: watch latency, traffic, errors, and saturation. For derived state, add projection age, cache hit rate, evictions, miss bursts, hot keys, and reconciliation drift.</p>
+      </section>
+
+      <section>
+        <h2>Failure Matrix</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Failure</th>
+              <th>Weak design</th>
+              <th>Stronger design</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Redis loses keys</td>
+              <td>Dashboard breaks because Redis was the only copy.</td>
+              <td>API reloads from projection table and repopulates cache.</td>
+            </tr>
+            <tr>
+              <td>Hot key expires</td>
+              <td>Hundreds of requests recompute the same value at once.</td>
+              <td>Use request coalescing, jittered TTLs, stale-while-refresh, or prewarming.</td>
+            </tr>
+            <tr>
+              <td>Stream job lags</td>
+              <td>API keeps serving old data with no visible warning.</td>
+              <td>Response includes <code>as_of</code>; alerts fire on projection age breach.</td>
+            </tr>
+            <tr>
+              <td>Replay writes old events</td>
+              <td>Old state overwrites newer dashboard values.</td>
+              <td>Projection updates require increasing version or newer event time.</td>
+            </tr>
+            <tr>
+              <td>Materialized view refresh blocks</td>
+              <td>Readers stall during a large refresh.</td>
+              <td>Use the right refresh mode, indexes, schedule, or an incremental projection table.</td>
+            </tr>
+            <tr>
+              <td>Projection drift</td>
+              <td>Team notices only after a customer reports wrong numbers.</td>
+              <td>Reconciliation compares source truth and derived totals continuously or on schedule.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>How to Defend the Resume Bullet</h2>
+        <p>Suppose someone asks: "How did your real-time dashboard stay fast and correct?" A strong answer separates source truth, projection, cache, freshness, and recovery.</p>
+        <div class="principle">
+          <p><strong>Strong answer shape:</strong></p>
+          <ol>
+            <li>Billing facts were committed to the source database and emitted through the outbox into Kafka.</li>
+            <li>A stream job computed merchant-level deltas and wrote a durable projection table shaped for dashboard reads.</li>
+            <li>Projection writes were idempotent and guarded by event version or event time to survive replay and backfill.</li>
+            <li>The API used Redis for hot dashboard objects, but Redis was treated as expendable acceleration, not source truth.</li>
+            <li>Cache entries had TTLs and could be invalidated or overwritten from new projection versions.</li>
+            <li>Responses exposed <code>as_of</code> metadata, and alerts watched projection age, hit rate, evictions, latency, errors, and drift.</li>
+            <li>Rebuilds replayed retained facts into a controlled target before cutover, with side effects disabled.</li>
+          </ol>
+        </div>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. Where should source truth live?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. The primary write store or event log owns correctness; projections and caches are derived.">Primary write store</button>
+            <button data-correct="false" data-why="">Every hot cache</button>
+            <button data-correct="false" data-why="">Browser tab memory</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. What does TTL primarily bound?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">Minimum query count</button>
+            <button data-correct="true" data-why="Correct. TTL bounds how long a cached value can survive without being refreshed or reloaded.">Maximum stale duration</button>
+            <button data-correct="false" data-why="">Global event order</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. Which metric proves cache usefulness?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">Topic partition count</button>
+            <button data-correct="false" data-why="">Replica region name</button>
+            <button data-correct="true" data-why="Correct. Hit/miss ratio shows whether the cache is actually serving reads instead of passing them through.">Hit miss ratio</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. Why version projection writes?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Version guards prevent older replayed events from overwriting newer serving state.">Reject stale updates</button>
+            <button data-correct="false" data-why="">Increase random sleeps</button>
+            <button data-correct="false" data-why="">Delete source rows</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required. These are the checks that show whether you can reason about serving state:</p>
+        <ol>
+          <li>For a merchant dashboard, why might you keep both a PostgreSQL projection table and a Redis cache?</li>
+          <li>What user-visible promise is stronger: "real time" or "MRR is usually under 30 seconds old"? Why?</li>
+          <li>What can go wrong if a replayed event updates a projection without a version guard?</li>
+          <li>When should an API bypass Redis and read from source or projection directly?</li>
+          <li>Which metrics would you put on a dashboard for cache health and projection freshness?</li>
+          <li>How would you rebuild the dashboard projection without emailing users or triggering partner webhooks?</li>
+        </ol>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. Useful debugging questions here are: "What is source truth?", "What is derived?", "How stale may it be?", "Can this cache disappear?", and "What proves the user saw fresh-enough data?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://www.postgresql.org/docs/current/rules-materializedviews.html">PostgreSQL Documentation: Materialized Views</a></li>
+          <li><a href="https://www.postgresql.org/docs/current/sql-refreshmaterializedview.html">PostgreSQL Documentation: REFRESH MATERIALIZED VIEW</a></li>
+          <li><a href="https://redis.io/docs/latest/develop/reference/eviction/">Redis Documentation: Key Eviction</a></li>
+          <li><a href="https://redis.io/docs/latest/commands/expire/">Redis Command Documentation: EXPIRE</a></li>
+          <li><a href="https://redis.io/docs/latest/develop/reference/client-side-caching/">Redis Documentation: Client-Side Caching</a></li>
+          <li><a href="https://sre.google/sre-book/monitoring-distributed-systems/">Google SRE Book: Monitoring Distributed Systems</a></li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
