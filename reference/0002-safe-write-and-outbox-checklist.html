@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: Safe Write and Outbox Checklist</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0002</div>
+        <h1>Safe Write and Outbox Checklist</h1>
+        <p class="lede">A compact checklist for turning retry-prone API commands into durable facts and reliably published events.</p>
+      </header>
+
+      <section>
+        <h2>The Recurring Shape</h2>
+        <div class="flow">
+          <div><strong>Command</strong>Client sends intent plus an idempotency key.</div>
+          <div><strong>Transaction</strong>Validate, mutate source state, record the key, and insert outbox event.</div>
+          <div><strong>Commit</strong>The command becomes a durable business fact.</div>
+          <div><strong>Relay</strong>Publisher drains outbox rows and sends them to the log.</div>
+          <div><strong>Consumers</strong>Downstream systems dedupe, process, and materialize state.</div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Schema Atoms</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Atom</th>
+              <th>Purpose</th>
+              <th>Common constraint</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>idempotency_keys</code></td>
+              <td>Remember a caller's request identity and semantic response.</td>
+              <td><code>UNIQUE(caller_id, key)</code></td>
+            </tr>
+            <tr>
+              <td><code>subscriptions</code></td>
+              <td>Store source-of-truth business state.</td>
+              <td>Version, state transition, or row lock guards.</td>
+            </tr>
+            <tr>
+              <td><code>outbox_events</code></td>
+              <td>Store messages in the same transaction as the state change.</td>
+              <td><code>UNIQUE(aggregate_type, aggregate_id, sequence)</code></td>
+            </tr>
+            <tr>
+              <td><code>processed_events</code></td>
+              <td>Let consumers ignore duplicate event deliveries.</td>
+              <td><code>UNIQUE(consumer_name, event_id)</code></td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Failure Checklist</h2>
+        <ul>
+          <li>If the client times out, retry with the same idempotency key.</li>
+          <li>If the service sees the same key and same intent, return a semantically equivalent response.</li>
+          <li>If the service sees the same key and different intent, reject it as a conflict.</li>
+          <li>If the database commits, the outbox row must already exist.</li>
+          <li>If the database rolls back, no outbox row should be publishable.</li>
+          <li>If the relay crashes after publishing, expect duplicate delivery after restart.</li>
+          <li>If duplicates are possible, consumers need event IDs and idempotent writes.</li>
+          <li>If ordering matters, partition and sequence by the aggregate that needs order.</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2>Useful Questions</h2>
+        <ol>
+          <li>What exact operation is safe to retry?</li>
+          <li>Who creates the idempotency key: caller, SDK, gateway, or service?</li>
+          <li>Where is the key recorded atomically with the mutation?</li>
+          <li>What response should a retry receive after the first request committed?</li>
+          <li>Can the relay publish twice, and how do consumers dedupe?</li>
+          <li>What aggregate key determines required ordering?</li>
+          <li>How do you rebuild or replay if the relay was broken?</li>
+        </ol>
+      </section>
+    </main>
+  </body>
+</html>

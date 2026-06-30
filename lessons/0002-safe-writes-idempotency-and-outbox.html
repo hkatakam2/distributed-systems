@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0002: Safe Writes, Idempotency, and Outbox</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0002</div>
+        <h1>Safe Writes: Idempotency and the Transactional Outbox</h1>
+        <p class="lede">The second mental model: a production write path is designed around ambiguity. The client may retry, the service may crash, the broker may duplicate, and the system still has to produce one durable business fact.</p>
+        <p class="compact">Mission link: this is the correctness core behind event-driven pipelines, payment retries, inventory updates, stream materialization, and defensible resume bullets about reliable distributed systems.</p>
+      </header>
+
+      <section>
+        <h2>Where This Fits</h2>
+        <p><a href="0001-from-request-to-real-time-system.html">Lesson 0001</a> gave the whole map: request, durable fact, log, processor, serving state, and operations. This lesson zooms into the riskiest boundary: turning a retry-prone command into a durable fact and a publishable event.</p>
+        <p>Keep <a href="../reference/0002-safe-write-and-outbox-checklist.html">Reference 0002: Safe Write and Outbox Checklist</a> nearby. It is the compressed version of this lesson.</p>
+      </section>
+
+      <section>
+        <h2>Concise Answers From Lesson 0001</h2>
+        <ol>
+          <li><strong>Cancellation command vs fact:</strong> <code>cancel_subscription</code> is the command; <code>subscription_canceled</code> is the durable fact.</li>
+          <li><strong>Required billing order:</strong> usually subscription order; merchant order is useful for merchant aggregates, but global order is too expensive and unnecessary.</li>
+          <li><strong>Crash after Redis update before checkpoint:</strong> the processor may replay the event and update Redis again, so the write must be idempotent or guarded by version/event ID.</li>
+          <li><strong>Detect Redis drift:</strong> compare Redis projections against database/log-derived truth with sampled checks, reconciliation jobs, freshness metrics, and aggregate audits.</li>
+          <li><strong>Queue vs replayable log:</strong> choose a queue for one-time task distribution; choose a log when ordering, replay, multiple consumers, or derived-state rebuilds matter.</li>
+          <li><strong>Paging metric:</strong> all can page under different SLOs; user-visible latency, freshness age, consumer lag, and DLQ growth represent different failures.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>The Big Idea</h2>
+        <p>A distributed write has an unavoidable ambiguity: if a client sends <code>POST /subscriptions/sub_123/cancel</code> and times out, neither side can know from the timeout alone whether the command committed. Retrying may be necessary, but retrying a non-idempotent write can create duplicate side effects.</p>
+        <p>Amazon's Builders' Library article on <a href="https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/">idempotent APIs</a> frames the production contract: callers should be able to retry safe operations, while services accept the implementation burden of identifying duplicate intent. The preferred shape is a caller-provided unique request identifier, not just a hash of parameters, because identical parameters can still represent different business intent.</p>
+        <p>The second ambiguity appears after the database write: the service must publish an event, but the database and broker usually do not share one transaction. The <a href="https://microservices.io/patterns/data/transactional-outbox.html">transactional outbox pattern</a> solves this by storing the event in the database transaction that changes business state. A relay publishes the outbox row later.</p>
+        <div class="map">
+          <p><strong>Safe write path:</strong></p>
+          <pre><code>client command + idempotency key
+  -> validate request
+  -> start database transaction
+  -> record idempotency key
+  -> mutate source-of-truth state
+  -> insert outbox event
+  -> commit transaction
+  -> relay publishes event to Kafka
+  -> consumers process idempotently</code></pre>
+        </div>
+      </section>
+
+      <section>
+        <h2>Scenario: Cancel a Subscription</h2>
+        <p>Assume a billing API receives a cancellation command. The user-visible requirement is simple: cancel once. The production requirement is sharper: retries, crashes, duplicate events, and stream replay must not produce multiple cancellations or inconsistent downstream metrics.</p>
+        <div class="flow">
+          <div><strong>Client</strong>Sends command with <code>Idempotency-Key</code>.</div>
+          <div><strong>API</strong>Checks whether this key was seen for this caller.</div>
+          <div><strong>DB</strong>Changes subscription and records an outbox event atomically.</div>
+          <div><strong>Relay</strong>Publishes pending outbox rows to Kafka.</div>
+          <div><strong>Metric</strong>Stream processor updates MRR and churn projections.</div>
+        </div>
+
+        <h3>Minimal schema shape</h3>
+        <pre><code>idempotency_keys(
+  caller_id, key, request_hash, response_status, response_body, expires_at,
+  unique(caller_id, key)
+)
+
+subscriptions(
+  id, merchant_id, status, version, canceled_at
+)
+
+outbox_events(
+  id, aggregate_type, aggregate_id, sequence, event_type, payload, status, created_at,
+  unique(aggregate_type, aggregate_id, sequence)
+)</code></pre>
+
+        <h3>Transaction shape</h3>
+        <pre><code>begin;
+
+-- 1. Claim or inspect the idempotency key for this caller.
+-- Same key + same request means return the original semantic result.
+-- Same key + different request means reject the command.
+
+select * from subscriptions where id = :subscription_id for update;
+
+-- 2. Make the state transition only if it is valid.
+update subscriptions
+set status = 'canceled',
+    version = version + 1,
+    canceled_at = now()
+where id = :subscription_id
+  and status in ('active', 'past_due');
+
+-- 3. Store the event in the same transaction as the state change.
+insert into outbox_events(...)
+values (..., 'subscription_canceled', ..., 'pending', now());
+
+-- 4. Store the response attached to the idempotency key.
+commit;</code></pre>
+        <p>PostgreSQL row locks such as <code>FOR UPDATE</code> are one way to guard the state transition. For queue-like outbox relays, <code>SKIP LOCKED</code> can help multiple workers avoid contending on the same rows, but PostgreSQL explicitly warns that it gives an inconsistent view and is appropriate for queue-like access rather than general reads.</p>
+      </section>
+
+      <section>
+        <h2>The Failure Matrix</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Failure</th>
+              <th>Bad design</th>
+              <th>Production design</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Client times out after commit</td>
+              <td>Retry creates a second cancellation or a confusing conflict.</td>
+              <td>Same idempotency key returns a semantically equivalent response.</td>
+            </tr>
+            <tr>
+              <td>Service crashes after DB commit</td>
+              <td>The subscription changes, but no event reaches the pipeline.</td>
+              <td>Outbox row is already committed and can be published later.</td>
+            </tr>
+            <tr>
+              <td>Service publishes before DB commit</td>
+              <td>Downstream sees a fact that may roll back.</td>
+              <td>Publish only after the committed outbox row exists.</td>
+            </tr>
+            <tr>
+              <td>Relay crashes after publish</td>
+              <td>Restart may publish the same event again.</td>
+              <td>Consumers dedupe by event ID or write idempotently.</td>
+            </tr>
+            <tr>
+              <td>Two updates race on one subscription</td>
+              <td>Order depends on timing and may corrupt state.</td>
+              <td>Lock, version, sequence, or conditional transition guards the aggregate.</td>
+            </tr>
+            <tr>
+              <td>Same key, different request</td>
+              <td>Service treats different intent as a duplicate.</td>
+              <td>Reject as conflict because the idempotency contract was violated.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Why This Is Not "Exactly Once"</h2>
+        <p>Kafka's design documentation separates producer durability, consumer position, and processing effects. It also notes that at-least-once processing can replay messages after a crash, while exactly-once claims depend on what systems participate in the transaction. Kafka transactions help when reading from Kafka and writing to Kafka, but writing to an external system such as Redis, PostgreSQL, or a payment provider still requires cooperation from that system.</p>
+        <p>The practical rule: design every boundary as if duplicates can happen. Use idempotency keys for client commands, outbox event IDs for publication, consumer-side dedupe for event handling, and reconciliation for catching the cases your assumptions missed.</p>
+      </section>
+
+      <section>
+        <h2>How to Defend the Resume Bullet</h2>
+        <p>Suppose someone asks: "How did you make the billing event pipeline reliable?" Do not only say "Kafka retries" or "we used DLQs." A stronger answer shows the write boundary.</p>
+        <div class="principle">
+          <p><strong>Strong answer shape:</strong></p>
+          <ol>
+            <li>Client writes used idempotency keys so retries did not create duplicate business effects.</li>
+            <li>The source-of-truth database transaction updated billing state and inserted an outbox event atomically.</li>
+            <li>A relay published committed outbox rows to Kafka, accepting that publish attempts could duplicate.</li>
+            <li>Events carried stable event IDs, aggregate IDs, sequence/version fields, and schema versioning metadata.</li>
+            <li>Consumers wrote idempotently and tracked processed event IDs where duplicate effects were unsafe.</li>
+            <li>Operations watched outbox depth, oldest unpublished event age, publish error rate, consumer lag, DLQ count, and reconciliation drift.</li>
+          </ol>
+        </div>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. What does an idempotency key identify?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. The key identifies one caller's retryable intent, not merely a matching payload.">One retryable intent</button>
+            <button data-correct="false" data-why="">Any matching payload</button>
+            <button data-correct="false" data-why="">Every future request</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. Why put the outbox row in the database transaction?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">Avoid all duplicates</button>
+            <button data-correct="true" data-why="Correct. If the business state commits, the publishable event commits with it.">Atomically record event</button>
+            <button data-correct="false" data-why="">Replace Kafka brokers</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. Relay crashes after publishing but before marking sent. What should you expect?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">Message is lost</button>
+            <button data-correct="true" data-why="Correct. The relay may publish again after restart, so consumers must tolerate duplicates.">Duplicate may appear</button>
+            <button data-correct="false" data-why="">Database rolls back</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. Same idempotency key, different request body. What should the service do?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">Publish both events</button>
+            <button data-correct="false" data-why="">Ignore body change</button>
+            <button data-correct="true" data-why="Correct. Same key with different intent violates the retry contract.">Reject as conflict</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required. These are the checks that show whether the write boundary is solid:</p>
+        <ol>
+          <li>For <code>POST /inventory/reserve</code>, what should the idempotency key represent?</li>
+          <li>What database uniqueness constraint prevents the same caller key from being claimed twice?</li>
+          <li>Why is "publish to Kafka, then commit the database" unsafe?</li>
+          <li>If an outbox relay publishes the same event twice, where should deduplication happen?</li>
+          <li>What ordering key would you use for subscription lifecycle events?</li>
+          <li>Which operational signal tells you that committed facts are not reaching Kafka quickly?</li>
+        </ol>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. Good debugging questions here are: "What committed?", "What can be retried?", "What can duplicate?", "Who dedupes?", and "Where is the event waiting?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/">Amazon Builders' Library: Making retries safe with idempotent APIs</a></li>
+          <li><a href="https://microservices.io/patterns/data/transactional-outbox.html">Microservices.io: Transactional outbox pattern</a></li>
+          <li><a href="https://kafka.apache.org/43/design/design/#message-delivery-semantics">Apache Kafka Design: Message delivery semantics</a></li>
+          <li><a href="https://www.postgresql.org/docs/current/sql-select.html">PostgreSQL Documentation: SELECT locking clauses</a></li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
