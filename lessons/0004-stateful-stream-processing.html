@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0004: Stateful Stream Processing</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0004</div>
+        <h1>Stateful Stream Processing: Keys, Time, and Checkpoints</h1>
+        <p class="lede">The fourth mental model: a stream processor is a distributed state machine. It reads replayable facts, groups them by key, remembers just enough state, and survives failure by restoring state plus input position.</p>
+        <p class="compact">Mission link: this is the practical core behind Flink jobs, real-time materialized views, MRR projections, inventory availability, backfills, freshness SLOs, and defensible claims about exactly-once processing.</p>
+      </header>
+
+      <section>
+        <h2>Where This Fits</h2>
+        <p><a href="0003-partitions-consumer-groups-and-replay.html">Lesson 0003</a> explained how Kafka-style logs scale through partitions, consumer groups, offsets, and replay. This lesson starts after records are consumed: how do you turn an infinite stream of facts into correct, queryable state?</p>
+        <p>Keep <a href="../reference/0004-stateful-stream-processing-checklist.html">Reference 0004: Stateful Stream Processing Checklist</a> nearby. It is the compressed checklist for this lesson.</p>
+      </section>
+
+      <section>
+        <h2>Concise Answers From Lesson 0003</h2>
+        <ol>
+          <li><strong>Why not global order:</strong> subscription lifecycle correctness needs order per subscription, not one expensive order for every unrelated customer.</li>
+          <li><strong>12 partitions, 20 consumers:</strong> at most 12 consumers actively read that topic inside one group.</li>
+          <li><strong>Commit before Redis:</strong> a crash can make the consumer skip the Redis update forever.</li>
+          <li><strong>Redis then crash before commit:</strong> the event can replay, so the Redis write must be idempotent, versioned, or recomputed.</li>
+          <li><strong>Hot partition signal:</strong> inspect lag, event age, processing time, and top keys per partition, not only average group lag.</li>
+          <li><strong>Replay side effects:</strong> disable or guard emails, payments, webhooks, partner calls, and any irreversible external action.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>The Big Idea</h2>
+        <p>Stateless consumers handle one record at a time. Stateful stream processors remember facts across records: the latest subscription version, a running merchant MRR total, a five-minute usage window, or a dedupe set of event IDs.</p>
+        <p>Flink's stateful stream processing model groups stream records by key, lets operators maintain state, and uses checkpoints for fault tolerance. The important production question is not "are we using Flink?" It is: <strong>what state is remembered, what key owns it, what time closes it, and what recovery point proves it can be rebuilt?</strong></p>
+        <div class="map">
+          <p><strong>Stateful processing shape:</strong></p>
+          <pre><code>Kafka event stream
+  -> assign event time and watermarks
+  -> key by the correctness boundary
+  -> update local keyed state
+  -> emit derived facts or aggregate updates
+  -> checkpoint state plus input positions
+  -> write idempotent materialized view</code></pre>
+        </div>
+      </section>
+
+      <section>
+        <h2>Scenario: Build an MRR Projection</h2>
+        <p>Suppose the product needs a fast merchant dashboard showing monthly recurring revenue. The source of truth is still billing state and billing events. Redis or PostgreSQL projection tables are serving state: fast to read, but derived.</p>
+        <p>A strong pipeline separates two correctness boundaries:</p>
+        <div class="flow">
+          <div><strong>Source</strong><code>billing_events</code> records subscription changes.</div>
+          <div><strong>Subscription</strong>Key by <code>subscription_id</code> to dedupe and compute delta.</div>
+          <div><strong>Merchant</strong>Re-key by <code>merchant_id</code> to aggregate MRR.</div>
+          <div><strong>Checkpoint</strong>Persist operator state and Kafka positions.</div>
+          <div><strong>View</strong>Upsert merchant totals with version or event-time guard.</div>
+        </div>
+        <p>The first key protects lifecycle correctness for one subscription. The second key groups all deltas that contribute to one merchant's dashboard. Re-keying is a real design move: it changes both the data distribution and the state that each task owns.</p>
+      </section>
+
+      <section>
+        <h2>Keyed State: Local Memory With a Contract</h2>
+        <p>Keyed state is state scoped to the current record's key. If all events for <code>sub_123</code> go through the same keyed operator, that operator can remember the last seen version, status, plan, quantity, and price for <code>sub_123</code>. It can then reject duplicates, ignore stale updates, or emit a precise revenue delta.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>State choice</th>
+              <th>What it enables</th>
+              <th>What can go wrong</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>subscription_id</code> state</td>
+              <td>Correct lifecycle deltas and duplicate suppression.</td>
+              <td>A missing version guard can apply old events after new ones.</td>
+            </tr>
+            <tr>
+              <td><code>merchant_id</code> state</td>
+              <td>Fast merchant-level totals for dashboards and alerts.</td>
+              <td>A large merchant can become a hot key with slow updates.</td>
+            </tr>
+            <tr>
+              <td>Global state</td>
+              <td>Simple mental model for tiny streams.</td>
+              <td>One bottleneck, weak parallelism, and expensive recovery.</td>
+            </tr>
+            <tr>
+              <td>No state</td>
+              <td>Simple event forwarding and filtering.</td>
+              <td>No dedupe, no aggregates, no memory of prior facts.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>Good keyed state is deliberately small. Store what the next event needs, not every historical event forever. If state can grow without bound, you need retention, TTL, compaction, snapshots, or a source-of-truth lookup strategy.</p>
+      </section>
+
+      <section>
+        <h2>Event Time: Time From the Fact, Not the Worker</h2>
+        <p>Processing time is when a worker handles a record. Event time is when the business fact happened. For dashboards and billing, event time is usually the better semantic clock because backlogs, retries, and replays should not move yesterday's cancellation into today's revenue.</p>
+        <p>Watermarks are how a stream processor tracks progress through event time. A watermark says, roughly: the system believes it has seen events up to this event-time point, with some allowed disorder. When the watermark passes a window boundary, the window can produce a result.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Choice</th>
+              <th>Use when</th>
+              <th>Failure mode</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Processing time</td>
+              <td>The wall-clock behavior of the job is the product behavior.</td>
+              <td>Backlogs and replays change the apparent timing of facts.</td>
+            </tr>
+            <tr>
+              <td>Event time</td>
+              <td>The business fact's timestamp determines the result.</td>
+              <td>Late and out-of-order events need explicit handling.</td>
+            </tr>
+            <tr>
+              <td>Watermark delay</td>
+              <td>You expect bounded out-of-order arrival.</td>
+              <td>Too short drops corrections; too long delays freshness.</td>
+            </tr>
+            <tr>
+              <td>Allowed lateness</td>
+              <td>Late events should update already emitted windows.</td>
+              <td>Downstream sinks must tolerate corrected outputs.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>This is the tradeoff behind many "real-time" systems: stricter freshness usually means less tolerance for late data; stronger event-time correctness usually means waiting longer or emitting corrections.</p>
+      </section>
+
+      <section>
+        <h2>Windows: Finite Questions Over Infinite Streams</h2>
+        <p>A stream does not end, so aggregate questions need boundaries. Windows create finite buckets over an unbounded stream. A five-minute usage total, hourly checkout conversion, and daily active merchant count are all windowed questions.</p>
+        <div class="principle">
+          <p><strong>Common window choices:</strong></p>
+          <ol>
+            <li><strong>Tumbling:</strong> fixed, non-overlapping buckets such as usage per five minutes.</li>
+            <li><strong>Sliding:</strong> overlapping buckets such as a one-hour error rate refreshed every five minutes.</li>
+            <li><strong>Session:</strong> activity grouped until a period of inactivity, useful for user journeys.</li>
+          </ol>
+        </div>
+        <p>For an MRR total, you may not need a time window at all. A running keyed aggregate can update the current merchant total after each subscription delta. For usage billing or rate metrics, windows are the natural shape because the question itself has a time boundary.</p>
+      </section>
+
+      <section>
+        <h2>Checkpoints: The Recovery Contract</h2>
+        <p>A checkpoint records the stream processor's state and the input positions that produced that state. After a crash, the job restores the checkpointed state and resumes from the checkpointed input positions. That is why replayable sources and deterministic state updates matter.</p>
+        <div class="map">
+          <p><strong>Failure path:</strong></p>
+          <pre><code>checkpoint C1: MRR state = $1000, Kafka offset = 100
+process offsets 101..130, write projection = $1120
+worker crashes before checkpoint C2 completes
+restore C1
+replay offsets 101..130
+projection write may happen again</code></pre>
+        </div>
+        <p>The processor can restore its internal state, but external sinks still need a contract. Redis, PostgreSQL, search indexes, and partner APIs do not magically join the processor's checkpoint unless the connector and sink protocol support it. The safe default is idempotent upsert, version checks, event IDs, transactional sink support where available, and reconciliation against source truth.</p>
+      </section>
+
+      <section>
+        <h2>Operations: What to Watch</h2>
+        <p>Stateful jobs fail differently from stateless consumers. They can be caught up on Kafka while watermark progress is stuck, or they can have healthy watermarks while checkpoints are timing out. Watch the pipeline from source to serving state.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Signal</th>
+              <th>What it tells you</th>
+              <th>Question to ask</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Kafka lag and event age</td>
+              <td>Whether source facts are being read promptly.</td>
+              <td>Which partition, key, or dependency is holding progress?</td>
+            </tr>
+            <tr>
+              <td>Watermark lag</td>
+              <td>Whether event-time results are fresh.</td>
+              <td>Is one source partition idle or far behind?</td>
+            </tr>
+            <tr>
+              <td>Checkpoint duration and failures</td>
+              <td>Whether state can be captured reliably.</td>
+              <td>Is state too large, storage slow, or backpressure severe?</td>
+            </tr>
+            <tr>
+              <td>State size</td>
+              <td>Whether memory and recovery cost are growing.</td>
+              <td>Do we need TTL, compaction, or a smaller state model?</td>
+            </tr>
+            <tr>
+              <td>Sink latency and failures</td>
+              <td>Whether the materialized view can keep up.</td>
+              <td>Is Redis, PostgreSQL, or the connector the bottleneck?</td>
+            </tr>
+            <tr>
+              <td>Projection drift</td>
+              <td>Whether derived state still matches source truth.</td>
+              <td>Can reconciliation explain and repair the difference?</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>How to Defend the Resume Bullet</h2>
+        <p>Suppose someone asks: "How did the real-time MRR projection stay correct during failures and backfills?" A strong answer names the state, time, checkpoint, sink, and operating model.</p>
+        <div class="principle">
+          <p><strong>Strong answer shape:</strong></p>
+          <ol>
+            <li>Billing facts came from a replayable Kafka topic populated from committed outbox events.</li>
+            <li>The job first keyed by subscription to dedupe, enforce version order, and compute revenue deltas.</li>
+            <li>It then keyed by merchant to maintain the current MRR aggregate used by the dashboard.</li>
+            <li>Event-time timestamps and watermarks controlled time-bounded outputs where the business question needed windows.</li>
+            <li>Checkpoints captured Flink state and Kafka positions, so crashes restored a known processing point.</li>
+            <li>The serving sink used idempotent upserts or version guards, because replay after recovery can repeat external writes.</li>
+            <li>Operations watched lag, watermark progress, checkpoint health, state size, sink latency, and reconciliation drift.</li>
+          </ol>
+        </div>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. What does keyed state attach to?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Keyed state belongs to the current event key, such as subscription_id or merchant_id.">Current event key</button>
+            <button data-correct="false" data-why="">Latest broker log</button>
+            <button data-correct="false" data-why="">Global wall clock</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. Why use event time for usage billing windows?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Billing should follow when the usage happened, not when a worker caught up.">Use occurrence time</button>
+            <button data-correct="false" data-why="">Use processing time</button>
+            <button data-correct="false" data-why="">Use partition count</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. What does a checkpoint restore?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">Schema plus broker</button>
+            <button data-correct="true" data-why="Correct. Recovery restores operator state and the source positions that produced it.">State plus position</button>
+            <button data-correct="false" data-why="">Cache plus alerts</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. What can late data within allowed lateness do?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">Erase source topic</button>
+            <button data-correct="false" data-why="">Commit every offset</button>
+            <button data-correct="true" data-why="Correct. A late event can update a window and produce a corrected result.">Fire window again</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required. These are the checks that show whether you can reason about stateful stream processing:</p>
+        <ol>
+          <li>For an MRR projection, why might the job key by subscription first and merchant second?</li>
+          <li>What state would you store per subscription, and what would you avoid storing?</li>
+          <li>When would processing time be acceptable, and when would event time be required?</li>
+          <li>What does a watermark delay trade off?</li>
+          <li>Why can an external Redis write happen twice after checkpoint recovery?</li>
+          <li>Which metrics distinguish "Kafka is caught up" from "the event-time view is fresh"?</li>
+        </ol>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. Useful debugging questions here are: "What is the key?", "What state is owned by that key?", "Which clock drives the result?", "What checkpoint restored?", and "Can the sink tolerate replay?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/stateful-stream-processing/">Apache Flink Documentation: Stateful Stream Processing</a></li>
+          <li><a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/event-time/generating_watermarks/">Apache Flink Documentation: Generating Watermarks</a></li>
+          <li><a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/operators/windows/">Apache Flink Documentation: Windows</a></li>
+          <li><a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/fault-tolerance/checkpointing/">Apache Flink Documentation: Checkpointing</a></li>
+          <li><a href="https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html">Apache KafkaConsumer API Documentation</a></li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>

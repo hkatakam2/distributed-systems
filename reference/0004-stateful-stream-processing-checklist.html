@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: Stateful Stream Processing Checklist</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0004</div>
+        <h1>Stateful Stream Processing Checklist</h1>
+        <p class="lede">A compact checklist for designing Flink-style jobs with keyed state, event time, watermarks, checkpoints, replay, and materialized view sinks.</p>
+      </header>
+
+      <section>
+        <h2>The Recurring Shape</h2>
+        <div class="flow">
+          <div><strong>Key</strong>Group events by the boundary that owns the state.</div>
+          <div><strong>State</strong>Remember only what future events need.</div>
+          <div><strong>Time</strong>Choose processing time or event time deliberately.</div>
+          <div><strong>Checkpoint</strong>Persist state plus source positions for recovery.</div>
+          <div><strong>Sink</strong>Write projections with replay-safe semantics.</div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Design Checklist</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Question</th>
+              <th>Good answer</th>
+              <th>Common trap</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>What owns the state?</td>
+              <td>Key by subscription, merchant, SKU, account, or another correctness boundary.</td>
+              <td>Using a convenient key that breaks ordering or creates hot state.</td>
+            </tr>
+            <tr>
+              <td>What state is stored?</td>
+              <td>Store the minimum data needed for dedupe, ordering, aggregation, or joins.</td>
+              <td>Keeping unbounded history inside the stream processor.</td>
+            </tr>
+            <tr>
+              <td>Which clock matters?</td>
+              <td>Use event time when the business fact's timestamp determines the result.</td>
+              <td>Letting backlogs and replays change historical totals.</td>
+            </tr>
+            <tr>
+              <td>How do windows close?</td>
+              <td>Use watermarks, allowed lateness, and correction-friendly sinks.</td>
+              <td>Dropping late but valid events without visibility.</td>
+            </tr>
+            <tr>
+              <td>What survives failure?</td>
+              <td>Checkpoint operator state and source positions to durable storage.</td>
+              <td>Assuming in-memory state survives worker loss.</td>
+            </tr>
+            <tr>
+              <td>Can the sink repeat?</td>
+              <td>Yes. Use idempotent upserts, versions, event IDs, or transactional connectors.</td>
+              <td>Assuming internal exactly-once automatically covers Redis or partner APIs.</td>
+            </tr>
+            <tr>
+              <td>What proves freshness?</td>
+              <td>Track source lag, event age, watermark lag, checkpoint health, and projection age.</td>
+              <td>Looking only at consumer lag while event-time progress is stuck.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Vocabulary</h2>
+        <p><strong>Stateful operator:</strong> a processing step that remembers information across records.</p>
+        <p><strong>Keyed state:</strong> state scoped to a specific event key, such as <code>subscription_id</code>.</p>
+        <p><strong>Window:</strong> a finite time bucket used to aggregate an unbounded stream.</p>
+        <p><strong>Event time:</strong> the time when the business fact happened.</p>
+        <p><strong>Processing time:</strong> the time when the worker processes the record.</p>
+        <p><strong>Watermark:</strong> event-time progress signal used to close windows and detect lateness.</p>
+        <p><strong>Allowed lateness:</strong> extra time for late events to update an already emitted window.</p>
+        <p><strong>Checkpoint:</strong> durable snapshot of operator state plus source positions.</p>
+        <p><strong>Savepoint:</strong> operator-triggered state snapshot commonly used for controlled upgrades or migrations.</p>
+        <p><strong>Replay-safe sink:</strong> external write path that tolerates repeated records after recovery or backfill.</p>
+      </section>
+
+      <section>
+        <h2>Useful Questions</h2>
+        <ol>
+          <li>What key owns the state this operator reads and writes?</li>
+          <li>Can any key become hot, and what happens if it does?</li>
+          <li>What state can be recomputed instead of stored forever?</li>
+          <li>Does this result depend on event time or processing time?</li>
+          <li>What should happen to late events?</li>
+          <li>Where are checkpoints stored, and how long does recovery take?</li>
+          <li>Can the sink tolerate duplicate writes after replay?</li>
+          <li>How do you reconcile the projection with source truth?</li>
+        </ol>
+      </section>
+    </main>
+  </body>
+</html>
