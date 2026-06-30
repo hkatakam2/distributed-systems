@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: Serving State, Cache, and Projection Checklist</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0005</div>
+        <h1>Serving State, Cache, and Projection Checklist</h1>
+        <p class="lede">A compact checklist for designing fast read paths without confusing derived state, caches, and source-of-truth data.</p>
+      </header>
+
+      <section>
+        <h2>The Recurring Shape</h2>
+        <div class="flow">
+          <div><strong>Truth</strong>Write facts to the authoritative store and log.</div>
+          <div><strong>Project</strong>Transform facts into query-shaped serving rows.</div>
+          <div><strong>Cache</strong>Keep hot copies close to the request path.</div>
+          <div><strong>Bound</strong>Name the freshness, invalidation, and rebuild contract.</div>
+          <div><strong>Observe</strong>Track latency, errors, saturation, hit rate, and staleness.</div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Design Checklist</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Question</th>
+              <th>Good answer</th>
+              <th>Common trap</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>What is source truth?</td>
+              <td>The write database, event log, or system of record that can rebuild derived state.</td>
+              <td>Treating Redis or a dashboard table as truth because reads are fast.</td>
+            </tr>
+            <tr>
+              <td>What query is being served?</td>
+              <td>Shape the projection around one concrete read path and its filters.</td>
+              <td>Building a generic mirror that is no faster or simpler than the source.</td>
+            </tr>
+            <tr>
+              <td>How stale may it be?</td>
+              <td>Define an explicit freshness budget, such as "merchant MRR is under 30 seconds old."</td>
+              <td>Saying "real time" without an age metric or user-facing fallback.</td>
+            </tr>
+            <tr>
+              <td>How are updates applied?</td>
+              <td>Use idempotent upserts with version, event-time, or sequence guards.</td>
+              <td>Letting older replayed events overwrite newer projection state.</td>
+            </tr>
+            <tr>
+              <td>How is cache validity bounded?</td>
+              <td>Use TTL, event-driven invalidation, versioned values, or a mix.</td>
+              <td>Keeping cached values forever because invalidation is inconvenient.</td>
+            </tr>
+            <tr>
+              <td>What happens on cache miss?</td>
+              <td>Load from projection or source, set TTL, and protect hot keys from stampedes.</td>
+              <td>Letting one hot expired key fan out into many identical database reads.</td>
+            </tr>
+            <tr>
+              <td>Can it be rebuilt?</td>
+              <td>Retain source facts, keep schema compatibility, and rehearse backfill into a controlled target.</td>
+              <td>Discovering during an incident that the projection has no trustworthy rebuild path.</td>
+            </tr>
+            <tr>
+              <td>What proves health?</td>
+              <td>Watch request latency, errors, cache hit rate, evictions, projection age, and drift.</td>
+              <td>Monitoring only Redis uptime while serving stale or wrong values.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Vocabulary</h2>
+        <p><strong>Source of truth:</strong> the authoritative state that owns correctness and can regenerate derived copies.</p>
+        <p><strong>Derived state:</strong> data computed from source facts for a faster or more convenient read path.</p>
+        <p><strong>Projection table:</strong> a query-shaped table maintained by application code, jobs, or stream processors.</p>
+        <p><strong>Materialized view:</strong> a stored query result that can be refreshed from its defining query.</p>
+        <p><strong>Cache:</strong> an expendable copy kept near the request path to reduce latency or load.</p>
+        <p><strong>TTL:</strong> time to live, after which a cached key expires and must be recomputed or reloaded.</p>
+        <p><strong>Eviction:</strong> removing cached keys, often because memory is constrained.</p>
+        <p><strong>Invalidation:</strong> marking cached data unusable after the underlying data changes.</p>
+        <p><strong>Freshness budget:</strong> the maximum acceptable age of served derived data.</p>
+        <p><strong>Hit rate:</strong> the share of cache lookups served from cache instead of the backing store.</p>
+        <p><strong>Cache stampede:</strong> many requests simultaneously recomputing or reloading the same missing hot key.</p>
+        <p><strong>Reconciliation:</strong> comparing derived state with source truth and repairing drift.</p>
+      </section>
+
+      <section>
+        <h2>Useful Questions</h2>
+        <ol>
+          <li>Which store is allowed to answer "what is true?"</li>
+          <li>Which exact read path is this projection or cache optimizing?</li>
+          <li>What is the user-visible freshness budget?</li>
+          <li>Can the write path safely update, invalidate, or version the derived copy?</li>
+          <li>Can replay or backfill run without corrupting newer values?</li>
+          <li>What happens if Redis is empty, full, slow, or down?</li>
+          <li>Which keys are hot, and how do you prevent stampedes?</li>
+          <li>How would you rebuild the projection from zero?</li>
+          <li>Which metric proves the served value is fresh enough?</li>
+        </ol>
+      </section>
+    </main>
+  </body>
+</html>
