@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0006: Observability Signals, Traces, and Debugging</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0006</div>
+        <h1>Observability: Signals, Traces, and Debugging Across the Path</h1>
+        <p class="lede">The sixth mental model: observability is not a pile of dashboards. It is the contract that lets you ask, "what did the user experience, where did the request or event go, and which component changed the outcome?"</p>
+        <p class="compact">Mission link: this is the practical layer behind production debugging, SLOs, OpenTelemetry, incident response, latency claims, Kafka lag investigations, cache freshness alerts, and defending whether a system is actually operable.</p>
+      </header>
+
+      <section>
+        <h2>Where This Fits</h2>
+        <p><a href="0005-serving-state-cache-and-projection.html">Lesson 0005</a> explained how fast read paths use projection tables, Redis caches, and freshness contracts. This lesson asks the operational question: when the dashboard is slow, stale, or wrong, how do you see enough of the system to debug it?</p>
+        <p>Keep <a href="../reference/0006-observability-signals-traces-and-debugging.html">Reference 0006: Observability and Debugging Checklist</a> nearby. It is the compressed checklist for this lesson.</p>
+      </section>
+
+      <section>
+        <h2>Concise Answers From Lesson 0005</h2>
+        <ol>
+          <li><strong>PostgreSQL projection plus Redis:</strong> the projection is durable, query-shaped, versioned, and rebuildable; Redis is expendable acceleration for hot reads.</li>
+          <li><strong>"Real time" vs 30 seconds:</strong> "MRR is under 30 seconds old" is stronger because it is measurable, alertable, and honest about staleness.</li>
+          <li><strong>Replay without version guard:</strong> an older event can overwrite newer derived state and move the dashboard backward.</li>
+          <li><strong>Bypass Redis:</strong> bypass when a write just happened, data is too stale, the cache is unhealthy, or correctness requires source or projection truth.</li>
+          <li><strong>Cache and projection metrics:</strong> watch hit rate, misses, evictions, latency, hot keys, projection age, source lag, error rate, and drift.</li>
+          <li><strong>Rebuild without side effects:</strong> replay retained facts into a controlled target with emails, payments, webhooks, and partner calls disabled or guarded.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>The Big Idea</h2>
+        <p>Monitoring tells you when something important is broken. Observability gives you enough structured evidence to explain how work moved through the system and where it changed shape. In a backend system, that evidence usually comes from metrics, traces, logs, and domain checks.</p>
+        <p>Google's SRE monitoring chapter separates symptoms from causes and names four user-facing signals: latency, traffic, errors, and saturation. OpenTelemetry gives names to telemetry signals: traces show a request path, spans represent units of work, metrics measure runtime behavior, logs record events, and context propagation carries correlation across process boundaries.</p>
+        <div class="map">
+          <p><strong>Observable request and event path:</strong></p>
+          <pre><code>HTTP request with trace context
+  -> API span: validate, authorize, write transaction
+  -> outbox publish metric and log
+  -> Kafka producer span or linked trace
+  -> consumer span: process event and update projection
+  -> Redis metric: hit, miss, set, eviction
+  -> dashboard response with freshness metadata
+  -> alert on user-visible breach, not random noise</code></pre>
+        </div>
+        <p>The skill is not "add more logs." The skill is to decide which signal answers which production question.</p>
+      </section>
+
+      <section>
+        <h2>Scenario: Merchant Dashboard Is Slow and Stale</h2>
+        <p>Suppose a merchant reports that the dashboard loads slowly and shows old MRR. A weak debugging path opens five dashboards and guesses. A stronger path follows the user-visible symptom backward through the system.</p>
+        <div class="flow">
+          <div><strong>User</strong>Latency and freshness breach on dashboard API.</div>
+          <div><strong>API</strong>Trace shows Redis miss and projection read time.</div>
+          <div><strong>Cache</strong>Metrics show hit rate drop and evictions.</div>
+          <div><strong>Stream</strong>Lag and projection age show delayed updates.</div>
+          <div><strong>Source</strong>Logs confirm facts were committed and emitted.</div>
+        </div>
+        <p>That path keeps the investigation anchored. The first question is not "is Kafka lagging?" It is "what did the user experience?" Then you ask which internal signal explains that symptom.</p>
+      </section>
+
+      <section>
+        <h2>Signals Have Jobs</h2>
+        <p>Metrics, traces, and logs overlap, but they are not interchangeable. Treat them as different indexes into production behavior.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Signal</th>
+              <th>Best at answering</th>
+              <th>Common mistake</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Metric</td>
+              <td>How often, how slow, how full, how old, how many.</td>
+              <td>Using only averages and missing tail latency or hot partitions.</td>
+            </tr>
+            <tr>
+              <td>Trace</td>
+              <td>Where one request or operation spent time across services.</td>
+              <td>Tracing HTTP calls but losing the causal path at queues and async work.</td>
+            </tr>
+            <tr>
+              <td>Log</td>
+              <td>What discrete thing happened, with stable fields for search.</td>
+              <td>Writing prose strings with no request ID, event ID, merchant ID, or version.</td>
+            </tr>
+            <tr>
+              <td>Domain check</td>
+              <td>Whether the result is correct according to business truth.</td>
+              <td>Thinking "200 OK" proves the dashboard number is right.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>For the merchant dashboard, a metric can show that p99 latency crossed 500 ms. A trace can show the slow request spent 430 ms waiting on PostgreSQL after a Redis miss. A log can show which projection version was read. A domain check can show that projected MRR differs from source truth by 2.1 percent.</p>
+      </section>
+
+      <section>
+        <h2>Start With Symptoms, Then Causes</h2>
+        <p>For paging, symptoms beat causes. A page should usually mean users are affected or are about to be affected. "Dashboard freshness is older than 30 seconds for 5 percent of merchant reads" is better than "consumer lag is nonzero." Lag may explain a freshness breach, but lag alone is not always a user-visible problem.</p>
+        <div class="principle">
+          <p><strong>Symptom-first alert shape:</strong></p>
+          <ol>
+            <li><strong>Latency:</strong> dashboard p95 or p99 exceeds the product budget.</li>
+            <li><strong>Traffic:</strong> request rate, event rate, and cache lookup rate changed sharply.</li>
+            <li><strong>Errors:</strong> explicit failures, bad responses, and policy failures such as stale data.</li>
+            <li><strong>Saturation:</strong> constrained resource is nearing the point where latency or errors rise.</li>
+          </ol>
+        </div>
+        <p>Cause metrics still matter. CPU, pool saturation, Kafka lag, checkpoint duration, Redis evictions, and database lock waits are excellent debugging signals. They should support the investigation instead of creating noisy pages by themselves.</p>
+      </section>
+
+      <section>
+        <h2>Trace the Critical Path</h2>
+        <p>A trace is useful when it follows the work boundary the user cares about. For synchronous APIs, that boundary is usually one request. For event-driven systems, the boundary may cross an outbox, Kafka topic, consumer group, stream job, projection table, and cache invalidation path.</p>
+        <p>OpenTelemetry spans can be server, client, producer, consumer, or internal spans. That vocabulary matters because async work breaks the simple parent-child shape: the producer may finish before the consumer starts. In that case, use span links or equivalent correlation to connect the cause without pretending the consumer is a synchronous child.</p>
+        <div class="map">
+          <pre><code>trace_id=abc
+HTTP POST /subscriptions/cancel
+  span api.cancel_subscription
+  span db.transaction
+  span outbox.insert
+  span kafka.produce billing_events
+
+linked trace_id=def, link=abc
+consumer billing_events partition=7 offset=120391
+  span projection.update merchant_dashboard_summary
+  span redis.del dash:{merchant_id}</code></pre>
+        </div>
+        <p>The goal is causal visibility: from a customer action to the event it produced, to the projection it changed, to the cached value a later read served.</p>
+      </section>
+
+      <section>
+        <h2>Use Stable Fields</h2>
+        <p>Unstructured logs force humans to read text. Structured logs and span attributes let tools join evidence. Do not log sensitive data, but do include stable identifiers that let you reconstruct the path.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Field</th>
+              <th>Why it helps</th>
+              <th>Where it appears</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>trace_id</code></td>
+              <td>Correlates logs, spans, and metrics for one operation.</td>
+              <td>HTTP request, producer, consumer, projection update.</td>
+            </tr>
+            <tr>
+              <td><code>request_id</code></td>
+              <td>Names one externally observed API call.</td>
+              <td>Gateway, API logs, response headers.</td>
+            </tr>
+            <tr>
+              <td><code>event_id</code></td>
+              <td>Supports dedupe, replay debugging, and side-effect guards.</td>
+              <td>Outbox row, Kafka record, consumer logs.</td>
+            </tr>
+            <tr>
+              <td><code>merchant_id</code></td>
+              <td>Finds hot keys, tenant-specific impact, and projection drift.</td>
+              <td>API, stream job, projection, cache.</td>
+            </tr>
+            <tr>
+              <td><code>source_version</code></td>
+              <td>Shows whether stale writes or replay moved state backward.</td>
+              <td>Events, projection rows, dashboard response.</td>
+            </tr>
+            <tr>
+              <td><code>as_of_event_time</code></td>
+              <td>Turns "real time" into a measurable freshness claim.</td>
+              <td>Projection table, API response, freshness metrics.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Debug by Narrowing the Path</h2>
+        <p>Google's troubleshooting chapter frames debugging as iterating between observations, hypotheses, and tests. For distributed systems, a practical version is path narrowing: split the end-to-end path into segments and find the first segment where expected behavior becomes actual bad behavior.</p>
+        <div class="principle">
+          <p><strong>Path-narrowing loop:</strong></p>
+          <ol>
+            <li>Name the user-visible symptom and time window.</li>
+            <li>Find one concrete affected request, merchant, event, or trace.</li>
+            <li>Walk the path backward: response, cache, projection, consumer, topic, outbox, source transaction.</li>
+            <li>At each boundary, compare expected input, actual input, expected output, and actual output.</li>
+            <li>Prefer tests that rule out a whole class of causes.</li>
+            <li>Mitigate user impact before spending too long on root cause.</li>
+          </ol>
+        </div>
+        <p>That last point matters. During a real incident, restoring service and preserving evidence beat perfect root-cause analysis. You can disable a risky cache path, route reads to the projection, or pause a bad deploy while keeping the notes needed for later diagnosis.</p>
+      </section>
+
+      <section>
+        <h2>What to Put on the Dashboard</h2>
+        <p>A useful dashboard mirrors the system map. It should show user symptoms first, then the major internal causes that explain those symptoms.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Layer</th>
+              <th>Symptom signal</th>
+              <th>Cause signal</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>API</td>
+              <td>p95/p99 latency, error rate, stale response rate.</td>
+              <td>DB wait, Redis wait, pool saturation, deploy marker.</td>
+            </tr>
+            <tr>
+              <td>Kafka</td>
+              <td>Event age for user-visible projections.</td>
+              <td>Consumer lag by partition, produce errors, hot keys.</td>
+            </tr>
+            <tr>
+              <td>Stream job</td>
+              <td>Projection freshness and dropped or late corrections.</td>
+              <td>Checkpoint duration, backpressure, watermark lag, restart count.</td>
+            </tr>
+            <tr>
+              <td>Projection</td>
+              <td>Stale or wrong dashboard rows.</td>
+              <td>Upsert errors, version rejections, lock waits, drift checks.</td>
+            </tr>
+            <tr>
+              <td>Redis</td>
+              <td>Cache-induced latency and miss bursts.</td>
+              <td>Hit rate, evictions, memory, hot keys, connection errors.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>How to Defend the Resume Bullet</h2>
+        <p>Suppose someone asks: "How did you know the real-time dashboard was healthy in production?" A strong answer names the user contract, the telemetry model, and the debugging path.</p>
+        <div class="principle">
+          <p><strong>Strong answer shape:</strong></p>
+          <ol>
+            <li>We defined user-visible SLOs for dashboard latency, error rate, and freshness, not just internal job health.</li>
+            <li>Responses included freshness metadata such as <code>as_of_event_time</code>, so stale data was measurable.</li>
+            <li>Metrics covered the four golden signals at the API plus domain metrics such as projection age and drift.</li>
+            <li>OpenTelemetry traces carried context across HTTP and database calls, and async events used producer and consumer spans or links.</li>
+            <li>Structured logs included request IDs, event IDs, tenant IDs, versions, offsets, and projection update results.</li>
+            <li>Dashboards were symptom-first, with internal cause panels for Kafka lag, checkpoints, Redis, PostgreSQL, and deploys.</li>
+            <li>During incidents, we mitigated user impact first, then narrowed the path from response to cache to projection to stream to source truth.</li>
+          </ol>
+        </div>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. Which set are the four golden signals?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Latency, traffic, errors, and saturation are the four symptom-oriented signals.">Latency traffic errors saturation</button>
+            <button data-correct="false" data-why="">Threads schemas indexes deployments</button>
+            <button data-correct="false" data-why="">Producers offsets keys partitions</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. What does a trace primarily show?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">Cache TTL limit</button>
+            <button data-correct="true" data-why="Correct. A trace shows the causal path and timing of work across operations and services.">Request causal path</button>
+            <button data-correct="false" data-why="">Index sort order</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. What should usually page a human?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">Interesting internal cause</button>
+            <button data-correct="false" data-why="">Expected batch delay</button>
+            <button data-correct="true" data-why="Correct. Pages should usually map to urgent user-visible symptoms or imminent user impact.">User visible symptom</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. What should cross service boundaries for correlation?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Propagated context IDs let telemetry from different services join into one causal investigation.">Correlation context IDs</button>
+            <button data-correct="false" data-why="">Raw password tokens</button>
+            <button data-correct="false" data-why="">Random local clocks</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required. These are the checks that show whether you can reason about production observability:</p>
+        <ol>
+          <li>Why is "dashboard freshness breach" a better page than "Kafka lag is nonzero"?</li>
+          <li>For a slow dashboard request, which evidence would you want from metrics, traces, logs, and domain checks?</li>
+          <li>What breaks if trace context is not propagated from the API into async event processing?</li>
+          <li>Which fields would you include in structured logs for a projection update?</li>
+          <li>How would you debug a dashboard that is fast, returns 200, but shows the wrong MRR?</li>
+          <li>What is one mitigation you might apply before finishing root-cause analysis?</li>
+        </ol>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. Useful debugging questions here are: "What did the user experience?", "Which request or event proves it?", "Where did the path first diverge?", and "What evidence would rule out this hypothesis?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://sre.google/sre-book/monitoring-distributed-systems/">Google SRE Book: Monitoring Distributed Systems</a></li>
+          <li><a href="https://sre.google/sre-book/effective-troubleshooting/">Google SRE Book: Effective Troubleshooting</a></li>
+          <li><a href="https://opentelemetry.io/docs/concepts/signals/traces/">OpenTelemetry Documentation: Traces</a></li>
+          <li><a href="https://opentelemetry.io/docs/concepts/signals/metrics/">OpenTelemetry Documentation: Metrics</a></li>
+          <li><a href="https://opentelemetry.io/docs/concepts/signals/logs/">OpenTelemetry Documentation: Logs</a></li>
+          <li><a href="https://opentelemetry.io/docs/concepts/context-propagation/">OpenTelemetry Documentation: Context Propagation</a></li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
