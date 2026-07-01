@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: Replication, Quorums, and Consistency</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0009</div>
+        <h1>Replication, Quorums, and Consistency</h1>
+        <p class="lede">A compact guide for deciding when replicated data should prefer availability, low latency, or strict correctness.</p>
+      </header>
+
+      <section>
+        <h2>The Recurring Shape</h2>
+        <div class="flow">
+          <div><strong>Invariant</strong>Name what must never be wrong.</div>
+          <div><strong>Replicas</strong>Choose where copies live and who can write.</div>
+          <div><strong>Commit</strong>Decide which acknowledgements make a write durable.</div>
+          <div><strong>Read</strong>Choose fresh, stale, local, or merged answers.</div>
+          <div><strong>Repair</strong>Detect lag, conflict, and divergence.</div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Vocabulary</h2>
+        <p><strong>Replica:</strong> a copy of data stored on another node, zone, or region.</p>
+        <p><strong>Replication factor N:</strong> the number of replicas intended to hold a copy of a key, row range, or shard.</p>
+        <p><strong>Write quorum W:</strong> the number of replicas that must acknowledge a write before the system reports success.</p>
+        <p><strong>Read quorum R:</strong> the number of replicas consulted before a read returns.</p>
+        <p><strong>Quorum overlap:</strong> when read and write sets intersect, often summarized as <code>R + W &gt; N</code> under stable membership.</p>
+        <p><strong>Leader replica:</strong> the replica that orders writes for a shard, partition, split, or consensus group.</p>
+        <p><strong>Follower replica:</strong> a replica that receives ordered writes from the leader and may serve some reads.</p>
+        <p><strong>Witness replica:</strong> a voter that helps form a write quorum without storing a full readable copy.</p>
+        <p><strong>Strong read:</strong> a read that observes the latest committed state allowed by the system's consistency contract.</p>
+        <p><strong>Stale read:</strong> a read from an older timestamp or lagging replica, usually traded for lower latency or local access.</p>
+        <p><strong>Eventual consistency:</strong> replicas may temporarily disagree, but converge if updates stop and repair completes.</p>
+        <p><strong>Conflict resolution:</strong> the logic that merges or chooses among concurrent versions.</p>
+      </section>
+
+      <section>
+        <h2>Decision Table</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Data boundary</th>
+              <th>Safer default</th>
+              <th>Why</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Ledger, payment state, inventory reservation, auth policy</td>
+              <td>Strong or transactional consistency; reject writes without quorum.</td>
+              <td>Wrong acceptance is worse than short unavailability.</td>
+            </tr>
+            <tr>
+              <td>Shopping cart additions, preferences, notification settings</td>
+              <td>Available writes with versioning and merge logic.</td>
+              <td>The product can often reconcile concurrent intent later.</td>
+            </tr>
+            <tr>
+              <td>Analytics dashboard, recommendation cards, search index</td>
+              <td>Stale or eventually consistent reads with an as-of marker.</td>
+              <td>Fresh-enough answers are useful if the contract is honest.</td>
+            </tr>
+            <tr>
+              <td>Cache or materialized view</td>
+              <td>Explicit freshness bound, source fallback, rebuild path.</td>
+              <td>The cache is a derived answer, not the authority.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Consistency Choice Checklist</h2>
+        <ol>
+          <li>What invariant is harmed if a read is stale?</li>
+          <li>What invariant is harmed if two writes both succeed during a partition?</li>
+          <li>Can the operation be merged safely, or must one order win?</li>
+          <li>Can the user tolerate rejection while a majority is unavailable?</li>
+          <li>Can a stale answer be labeled with <code>as_of</code>, version, or freshness age?</li>
+          <li>Which region, zone, or replica owns the lowest-latency write path?</li>
+          <li>What happens during leader failover or membership change?</li>
+          <li>How are lagging replicas repaired: replay, anti-entropy, read repair, or rebuild?</li>
+          <li>What metric proves replicas are converging?</li>
+          <li>What runbook explains when to prefer availability over correctness?</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Metrics To Watch</h2>
+        <ul>
+          <li>Replication lag by replica, partition, or split.</li>
+          <li>Read staleness age and stale-read rate.</li>
+          <li>Quorum failure count and unavailable-write rate.</li>
+          <li>Leader election count, leader transfer rate, and failover duration.</li>
+          <li>Conflict count, merge count, and unresolved version count.</li>
+          <li>Read repair, hinted handoff, replay, or anti-entropy backlog.</li>
+          <li>Cross-region replicated bytes and replication saturation.</li>
+          <li>Domain drift between source truth and derived projections.</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2>Answer Shape</h2>
+        <div class="principle">
+          <p><strong>When defending a storage choice:</strong></p>
+          <ol>
+            <li>Name the invariant and the user-visible failure you are preventing.</li>
+            <li>Name the replica topology and who orders writes.</li>
+            <li>Name the commit rule: leader ack, majority quorum, configurable <code>W</code>, or async propagation.</li>
+            <li>Name the read rule: leader read, quorum read, strong replica read, stale local read, or cache read.</li>
+            <li>Name the failure behavior: reject, degrade, merge, repair, replay, or rebuild.</li>
+            <li>Name the metrics proving the system is correct enough for its contract.</li>
+          </ol>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
