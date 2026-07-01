@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0007: Reliability Controls, Timeouts, Retries, and Degradation</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0007</div>
+        <h1>Reliability Controls: Timeouts, Retries, Backoff, and Degradation</h1>
+        <p class="lede">The seventh mental model: reliability controls are pressure valves. They bound how long work waits, decide which failures deserve another attempt, isolate scarce capacity, and preserve the most important user promise when a dependency is sick.</p>
+        <p class="compact">Mission link: this is the practical layer behind production incident mitigation, SLO defense, retry-safe APIs, dependency failure design, cascading failure prevention, and backend answers that show operational judgment.</p>
+      </header>
+
+      <section>
+        <h2>Where This Fits</h2>
+        <p><a href="0006-observability-signals-traces-and-debugging.html">Lesson 0006</a> showed how to detect and debug slow, stale, or wrong behavior across a distributed path. This lesson asks the next production question: once a boundary is slow or failing, what should the system do?</p>
+        <p>Keep <a href="../reference/0007-reliability-controls.html">Reference 0007: Reliability Controls Checklist</a> nearby. It is the compressed decision sheet for this lesson.</p>
+      </section>
+
+      <section>
+        <h2>Concise Answers From Lesson 0006</h2>
+        <ol>
+          <li><strong>Freshness breach versus nonzero lag:</strong> freshness breach is user-visible and measurable; some lag may be normal or harmless.</li>
+          <li><strong>Slow dashboard evidence:</strong> metrics show rate and severity, traces show where time went, logs identify the affected request or version, and domain checks prove whether the result was fresh and correct.</li>
+          <li><strong>Broken async trace context:</strong> you lose the causal link from user action to event, consumer update, projection write, and later read.</li>
+          <li><strong>Projection log fields:</strong> include trace ID, request ID, event ID, merchant ID, source version, partition, offset, update result, and as-of timestamp.</li>
+          <li><strong>Fast 200 but wrong MRR:</strong> compare source truth to the projection, inspect replay/version guards, check cache version, and look for drift.</li>
+          <li><strong>Early mitigation:</strong> rollback a bad deploy, bypass a sick cache, serve a degraded response, pause a dangerous consumer, or route reads to a safer source.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>The Big Idea</h2>
+        <p>A distributed system fails badly when callers keep waiting, retrying, and queueing after the useful deadline has already passed. The right move is not "always retry." The right move is to decide what each boundary is allowed to spend, repeat, reject, isolate, or degrade.</p>
+        <p>The <a href="https://grpc.io/docs/guides/deadlines/">gRPC deadline guide</a> frames deadlines as the point after which a client no longer wants the result. AWS guidance on <a href="https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/retry-backoff.html">retry with backoff</a>, <a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/">jitter</a>, and <a href="https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/circuit-breaker.html">circuit breakers</a> adds the production control layer. Google's SRE chapter on <a href="https://sre.google/sre-book/handling-overload/">handling overload</a> is the broader operating model: protect the service and preserve the most important work.</p>
+        <div class="map">
+          <p><strong>Reliability-control path:</strong></p>
+          <pre><code>dashboard request budget: 150 ms
+  -> Redis lookup budget: 15 ms, no retry, fallback to projection
+  -> projection DB budget: 60 ms, one safe retry for transient error
+  -> analytics enrichment budget: 25 ms, circuit breaker, optional
+  -> response: core dashboard now, degraded enrichment if needed
+  -> telemetry: timeout, retry, breaker, pool, and degraded-response metrics</code></pre>
+        </div>
+        <p>The engineering skill is to make the failure behavior explicit before the incident. Otherwise the default behavior becomes unbounded waiting, synchronized retries, shared-pool exhaustion, and mystery partial failures.</p>
+      </section>
+
+      <section>
+        <h2>Scenario: Dashboard Depends on Three Boundaries</h2>
+        <p>Suppose the merchant dashboard from earlier lessons reads a Redis cache, falls back to a PostgreSQL projection, and calls a recommendation service for optional "next best action" cards. The user contract is under 150 ms and the core MRR numbers must be fresh enough to trust.</p>
+        <div class="flow">
+          <div><strong>Request</strong>150 ms total user-visible deadline.</div>
+          <div><strong>Redis</strong>Fast path, tiny timeout, no retry.</div>
+          <div><strong>Projection</strong>Durable fallback, bounded retry if safe.</div>
+          <div><strong>Recommend</strong>Optional feature, circuit breaker.</div>
+          <div><strong>Respond</strong>Core dashboard, clear degraded state.</div>
+        </div>
+        <p>If Redis is slow, waiting 500 ms is already a bug because the request deadline is 150 ms. If the recommendation service is down, failing the whole dashboard is also a bug because that feature is optional. Reliability design starts by naming which parts are critical and which can degrade.</p>
+      </section>
+
+      <section>
+        <h2>Deadlines: Stop Spending After Value Expires</h2>
+        <p>A timeout says how long one operation may wait. A deadline says when the overall result stops being useful. Deadlines are stronger because every downstream call can receive the remaining budget instead of inventing its own local wait time.</p>
+        <div class="principle">
+          <p><strong>Budget split example:</strong></p>
+          <pre><code>total dashboard deadline = 150 ms
+gateway and auth          = 20 ms
+application logic         = 25 ms
+Redis cache lookup        = 15 ms
+projection read           = 60 ms
+optional enrichment       = 25 ms
+response overhead         = 5 ms</code></pre>
+        </div>
+        <p>Deadlines also make cancellation meaningful. If a caller has gone away or the deadline is exceeded, continuing expensive work can hurt other users. The service should stop work it no longer needs, release the resource, and record the timeout as a signal.</p>
+      </section>
+
+      <section>
+        <h2>Retries: Repeat Only When It Helps</h2>
+        <p>A retry is a bet: the first attempt failed because of a transient condition, and another attempt can succeed before the user's deadline expires. That bet is often reasonable for connection resets, temporary 503s, or leader changes. It is dangerous for non-idempotent writes, long-running operations, and overloaded dependencies.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Retry question</th>
+              <th>Good answer</th>
+              <th>Bad answer</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Is duplicate execution safe?</td>
+              <td>Idempotency key, event ID, version guard, or read-only operation.</td>
+              <td>"Probably fine" for a charge, email, or partner webhook.</td>
+            </tr>
+            <tr>
+              <td>Is there enough time left?</td>
+              <td>Retry only if the remaining deadline can cover another attempt.</td>
+              <td>Retry after the user-visible deadline has already passed.</td>
+            </tr>
+            <tr>
+              <td>How many attempts?</td>
+              <td>Small bounded count or retry budget.</td>
+              <td>Unbounded loop hidden inside every client.</td>
+            </tr>
+            <tr>
+              <td>Where should retries live?</td>
+              <td>At the layer with context about idempotency and user value.</td>
+              <td>At every layer, multiplying one request into many attempts.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>Connect this back to <a href="0002-safe-writes-idempotency-and-outbox.html">Lesson 0002</a>: write retries require a contract that makes duplicate intent harmless. Without that contract, retrying can turn a temporary network failure into duplicate business side effects.</p>
+      </section>
+
+      <section>
+        <h2>Backoff and Jitter: Avoid Retry Storms</h2>
+        <p>When many clients fail at once, immediate retries can become the outage. Backoff waits longer after repeated failures. Jitter adds randomness so clients do not all retry on the same schedule.</p>
+        <div class="map">
+          <pre><code>bad retry behavior
+  t=0 ms: 10,000 clients fail
+  t=1 ms: 10,000 clients retry together
+  t=2 ms: 10,000 clients retry together again
+
+better retry behavior
+  t=0 ms: 10,000 clients fail
+  t=20-80 ms: first retry attempts spread out
+  t=80-250 ms: later attempts spread out more
+  stop when retry budget or deadline is exhausted</code></pre>
+        </div>
+        <p>Backoff and jitter are not politeness. They reduce correlated pressure, improve recovery chances, and make overload visible instead of hiding it behind waves of client traffic.</p>
+      </section>
+
+      <section>
+        <h2>Circuit Breakers: Fail Fast While Recovery Happens</h2>
+        <p>A circuit breaker is useful when a dependency is clearly failing or too slow. Instead of sending every request into a known-bad path, the breaker opens and fails fast or returns a fallback. After a delay, it allows limited probe traffic to see whether the dependency has recovered.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>State</th>
+              <th>Behavior</th>
+              <th>Dashboard example</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Closed</td>
+              <td>Calls flow normally while errors and latency stay acceptable.</td>
+              <td>Recommendation service enriches the dashboard.</td>
+            </tr>
+            <tr>
+              <td>Open</td>
+              <td>Calls fail fast or use fallback because the dependency is unhealthy.</td>
+              <td>Dashboard omits recommendations instead of waiting.</td>
+            </tr>
+            <tr>
+              <td>Half-open</td>
+              <td>Small probe traffic tests whether normal calls can resume.</td>
+              <td>A few recommendation calls are allowed and measured.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>Breakers are not a substitute for fixing the dependency. They are a containment device. Instrument state changes, open duration, fallback rate, and user-visible impact.</p>
+      </section>
+
+      <section>
+        <h2>Bulkheads and Load Shedding: Contain the Blast Radius</h2>
+        <p>The <a href="https://learn.microsoft.com/en-us/azure/architecture/patterns/bulkhead">bulkhead pattern</a> isolates capacity so one path cannot consume everything. In backend systems, that usually means separate connection pools, worker pools, queues, or concurrency limits for critical versus optional work, tenants, or dependencies.</p>
+        <div class="principle">
+          <p><strong>Isolation examples:</strong></p>
+          <ol>
+            <li>Separate DB connection pool for checkout writes and dashboard reads.</li>
+            <li>Separate worker pool for webhook delivery and internal projection updates.</li>
+            <li>Per-tenant concurrency limits so one large merchant cannot starve everyone.</li>
+            <li>Queue length and queue age limits so stale work is rejected before it wastes capacity.</li>
+          </ol>
+        </div>
+        <p>Load shedding is the direct version: reject or drop lower-priority work when accepting it would harm more important work. A 503 with a retry hint can be healthier than accepting work that will time out after consuming scarce resources.</p>
+      </section>
+
+      <section>
+        <h2>Graceful Degradation: Preserve the Core Promise</h2>
+        <p>Graceful degradation means the system returns a smaller or older result that is still honest. It is not silently lying. For the dashboard, useful degradation might mean returning core MRR and subscription counts while omitting recommendations, marking analytics as delayed, or serving a stale-but-labeled summary within a freshness policy.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Failure</th>
+              <th>Weak behavior</th>
+              <th>Stronger behavior</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Redis slow</td>
+              <td>Wait until the whole request times out.</td>
+              <td>Timeout quickly and read the projection table.</td>
+            </tr>
+            <tr>
+              <td>Projection slow</td>
+              <td>Stack retries until database pressure increases.</td>
+              <td>One bounded safe retry, then serve labeled stale data or fail clearly.</td>
+            </tr>
+            <tr>
+              <td>Recommendation down</td>
+              <td>Fail the dashboard because optional cards are missing.</td>
+              <td>Open the breaker and return the core dashboard without cards.</td>
+            </tr>
+            <tr>
+              <td>Tenant traffic spike</td>
+              <td>Let one tenant saturate every worker.</td>
+              <td>Enforce tenant limits and protect critical shared work.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>How to Defend the Resume Bullet</h2>
+        <p>Suppose someone asks: "How did your backend handle dependency failures without cascading outages?" A strong answer names the user contract, the controls, and the evidence.</p>
+        <div class="principle">
+          <p><strong>Strong answer shape:</strong></p>
+          <ol>
+            <li>We defined a user-visible deadline for the API and passed smaller budgets to downstream calls.</li>
+            <li>Critical dependencies had explicit timeouts, cancellation, and metrics for deadline exceeded errors.</li>
+            <li>Retries were limited to idempotent or read-only operations, with bounded attempts and backoff with jitter.</li>
+            <li>Optional dependencies used circuit breakers and fallback responses so they could not fail the core workflow.</li>
+            <li>Connection pools, worker pools, and queues were isolated by priority or dependency to prevent shared exhaustion.</li>
+            <li>Under overload, lower-priority work was shed before it harmed critical requests.</li>
+            <li>Dashboards tracked timeouts, retry attempts, breaker state, pool saturation, degraded responses, and user-visible latency and errors.</li>
+          </ol>
+        </div>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. What is the main job of a deadline?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. A deadline bounds useful waiting so work stops after the caller no longer needs the result.">Bound request waiting</button>
+            <button data-correct="false" data-why="">Extend hidden queues</button>
+            <button data-correct="false" data-why="">Retry forever quietly</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. What reduces synchronized retry pressure?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">Synchronized fast retries</button>
+            <button data-correct="true" data-why="Correct. Backoff with jitter spreads retry attempts so clients do not hammer a recovering dependency together.">Backoff with jitter</button>
+            <button data-correct="false" data-why="">Unbounded immediate loops</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. What does a circuit breaker primarily do?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">Remove network latency</button>
+            <button data-correct="false" data-why="">Guarantee database correctness</button>
+            <button data-correct="true" data-why="Correct. A circuit breaker fails fast while a dependency appears unhealthy and probes for recovery later.">Fail fast temporarily</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. What contains one path's resource exhaustion?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Bulkhead resource pools isolate capacity so one failing path cannot consume everything.">Bulkhead resource pools</button>
+            <button data-correct="false" data-why="">Shared global queue</button>
+            <button data-correct="false" data-why="">Single retry counter</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required. These are the checks that show whether you can reason about reliability controls:</p>
+        <ol>
+          <li>Why is a deadline stronger than a local timeout for a chain of service calls?</li>
+          <li>When is retrying a failed write safe, and when can it create duplicate business effects?</li>
+          <li>How do backoff and jitter change the shape of traffic after a shared failure?</li>
+          <li>What should happen when an optional dependency is down but the core dashboard can still be served?</li>
+          <li>Which resources would you isolate with bulkheads in a billing or dashboard system?</li>
+          <li>What metrics would tell you that retries are making an outage worse instead of better?</li>
+        </ol>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. Useful reliability questions here are: "What is the user deadline?", "Is this retry safe?", "What should degrade?", "Which pool can saturate?", and "What protects critical work first?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://grpc.io/docs/guides/deadlines/">gRPC Documentation: Deadlines</a></li>
+          <li><a href="https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/retry-backoff.html">AWS Prescriptive Guidance: Retry with backoff pattern</a></li>
+          <li><a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/">AWS Architecture Blog: Exponential Backoff and Jitter</a></li>
+          <li><a href="https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/circuit-breaker.html">AWS Prescriptive Guidance: Circuit breaker pattern</a></li>
+          <li><a href="https://learn.microsoft.com/en-us/azure/architecture/patterns/bulkhead">Microsoft Azure Architecture Center: Bulkhead pattern</a></li>
+          <li><a href="https://sre.google/sre-book/handling-overload/">Google SRE Book: Handling Overload</a></li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
