@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0010: Transaction Isolation and Concurrency Control</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0010</div>
+        <h1>Transaction Isolation and Concurrency Control</h1>
+        <p class="lede">The tenth mental model: correctness is not only about where data is replicated. It is also about what happens when many requests try to read and write the same authority at the same time.</p>
+        <p class="compact">Mission link: this is the judgment behind PostgreSQL transactions, inventory reservation, billing ledgers, idempotency tables, safe retries, outbox writes, and defending why a production write path stays correct under concurrent traffic.</p>
+      </header>
+
+      <section>
+        <h2>Where This Fits</h2>
+        <p><a href="0009-replication-quorums-and-consistency.html">Lesson 0009</a> asked which replica is allowed to accept or answer state. This lesson zooms inside one authoritative database boundary and asks: once a request reaches the authority, what prevents concurrent requests from violating the business rule?</p>
+        <p>Keep <a href="../reference/0010-transaction-isolation-and-concurrency-control.html">Reference 0010: Transaction Isolation and Concurrency Control</a> nearby. It is the compressed decision sheet for this lesson.</p>
+      </section>
+
+      <section>
+        <h2>Concise Answers From Lesson 0009</h2>
+        <ol>
+          <li><strong>Replicas complicate reads:</strong> durability improves because more copies survive failure, but reads must know which copy is fresh enough.</li>
+          <li><strong>Rejecting a write:</strong> rejection is better when accepting during a partition could violate money, inventory, auth, or ordering invariants.</li>
+          <li><strong><code>R + W &gt; N</code> limit:</strong> overlap helps, but membership, versioning, repair, conflict handling, and failure detection still matter.</li>
+          <li><strong>Safely stale data:</strong> dashboards, recommendations, and search can often be stale; ledgers, reservations, and access decisions usually cannot.</li>
+          <li><strong>Materialized metadata:</strong> attach source offset, source version, as-of timestamp, projection version, and freshness age.</li>
+          <li><strong>Convergence metrics:</strong> watch lag, drift, conflict count, replay backlog, repair backlog, and stale-read age.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>The Big Idea</h2>
+        <p>A transaction gives a group of operations an all-or-nothing commit boundary. Isolation defines what that group can observe while other transactions run at the same time. Concurrency control is how the database preserves the isolation contract through snapshots, locks, constraints, aborts, and retries.</p>
+        <p>PostgreSQL's <a href="https://www.postgresql.org/docs/current/transaction-iso.html">transaction isolation documentation</a> defines the standard phenomena: dirty reads, nonrepeatable reads, phantom reads, and serialization anomalies. It also explains PostgreSQL's three real behaviors: Read Committed, Repeatable Read, and Serializable. The <a href="https://www.postgresql.org/docs/current/explicit-locking.html">explicit locking docs</a> explain row locks and <code>SELECT FOR UPDATE</code>. The <a href="https://www.postgresql.org/docs/current/ddl-constraints.html">constraints docs</a> and <a href="https://www.postgresql.org/docs/current/sql-insert.html">INSERT / ON CONFLICT docs</a> show a production habit: express invariants in the database when you can.</p>
+        <div class="map">
+          <p><strong>Concurrent write decision path:</strong></p>
+          <pre><code>business invariant
+  -> rows and tables involved
+  -> simplest database guard
+  -> expected conflict outcome
+  -> retry boundary
+  -> observability for contention and correctness</code></pre>
+        </div>
+        <p>The practical skill is to stop saying "we used a transaction" as if that answers the question. A senior answer says which invariant the transaction protects, which isolation or lock behavior is required, and what the application does when the database rejects a concurrent execution.</p>
+      </section>
+
+      <section>
+        <h2>Scenario: Reserve Inventory and Emit an Event</h2>
+        <p>Suppose checkout reserves one unit of inventory and emits an event for downstream billing and fulfillment. Two customers can hit the same SKU at the same time, and retries can send the same client request more than once.</p>
+        <div class="flow">
+          <div><strong>Request</strong>Client sends idempotency key.</div>
+          <div><strong>Dedup</strong>Unique key records one logical attempt.</div>
+          <div><strong>Reserve</strong>Inventory update must not go negative.</div>
+          <div><strong>Outbox</strong>Event commits with state change.</div>
+          <div><strong>Retry</strong>Conflicts return known result or retry safely.</div>
+        </div>
+        <p>The invariant is not "run SQL in a transaction." The invariant is: one logical checkout should reserve at most once, inventory must not go below zero, and any successful reservation must have a corresponding outbox event.</p>
+      </section>
+
+      <section>
+        <h2>Pick the Smallest Correct Guard</h2>
+        <p>The strongest tool is not always the best first tool. The right tool depends on the shape of the invariant.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Invariant</th>
+              <th>Useful guard</th>
+              <th>Why it works</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Same request must not create two reservations.</td>
+              <td><code>UNIQUE (merchant_id, idempotency_key)</code> plus <code>ON CONFLICT</code>.</td>
+              <td>The database arbitrates duplicates even when app servers race.</td>
+            </tr>
+            <tr>
+              <td>Inventory must not go below zero for one SKU row.</td>
+              <td><code>UPDATE inventory SET available = available - 1 WHERE sku = $1 AND available &gt; 0</code>.</td>
+              <td>Conflicting row updates wait; the predicate is rechecked against the current row.</td>
+            </tr>
+            <tr>
+              <td>Only one active plan per merchant.</td>
+              <td>Unique or partial unique index if the condition fits the schema.</td>
+              <td>A constraint is more reliable than checking in application code before insert.</td>
+            </tr>
+            <tr>
+              <td>At least one operator must remain on call.</td>
+              <td>Serializable transaction, or lock a concrete guard row before changing membership.</td>
+              <td>The rule depends on a set, so row-by-row snapshots can be misleading.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>If a constraint can express the invariant, prefer that. If one conditional statement can express it, prefer that. Use explicit locks or Serializable isolation when the invariant spans a changing set of rows that cannot be reduced to a simple constraint.</p>
+      </section>
+
+      <section>
+        <h2>Read Committed: Each Statement Gets Its Own View</h2>
+        <p>Read Committed is PostgreSQL's default isolation level. A plain <code>SELECT</code> sees data committed before that statement began. Two <code>SELECT</code> statements inside the same transaction can see different results if another transaction commits between them.</p>
+        <div class="principle">
+          <p><strong>Good fit:</strong> a simple keyed update where every statement names the exact row and carries the predicate that protects the invariant.</p>
+          <pre><code>BEGIN;
+
+WITH attempt AS (
+  INSERT INTO request_dedupe (merchant_id, idempotency_key, status)
+  VALUES ($1, $2, 'started')
+  ON CONFLICT (merchant_id, idempotency_key) DO NOTHING
+  RETURNING id
+),
+reserved AS (
+  UPDATE inventory
+  SET available = available - 1
+  WHERE sku = $3
+    AND available &gt; 0
+    AND EXISTS (SELECT 1 FROM attempt)
+  RETURNING sku
+)
+INSERT INTO outbox (event_type, aggregate_id, payload)
+SELECT 'inventory_reserved', sku, $4
+FROM reserved;
+
+COMMIT;</code></pre>
+        </div>
+        <p>This shape still needs application handling for zero rows inserted into <code>outbox</code>: either the request was a duplicate, or no inventory remained. The trap is moving the predicate into application memory: <code>SELECT available</code>, compute in code, then later <code>UPDATE inventory SET available = new_value</code>. Under concurrency, that shape can overwrite a fact learned by another transaction. Put the invariant in the statement or in a constraint.</p>
+      </section>
+
+      <section>
+        <h2>Repeatable Read: Stable Snapshot, Not Full Safety</h2>
+        <p>Repeatable Read gives a transaction a stable snapshot from the start of the transaction's first real statement. In PostgreSQL, that prevents nonrepeatable reads and phantoms. But it can still allow serialization anomalies: the final result may not match any one-at-a-time ordering of the same transactions.</p>
+        <div class="map">
+          <p><strong>Write skew shape:</strong></p>
+          <pre><code>rule: at least one operator must remain on call
+
+T1 reads: Alice on call, Bob on call
+T2 reads: Alice on call, Bob on call
+T1 turns Alice off call
+T2 turns Bob off call
+both commit under a snapshot-isolation style contract
+
+final state: nobody is on call</code></pre>
+        </div>
+        <p>Each transaction made a locally reasonable choice from its snapshot. Together they violated the cross-row invariant. The fix is not "try Repeatable Read harder." The fix is to make the conflict concrete: use Serializable with retries, lock a shared guard row, or redesign the rule into a constraint the database can enforce.</p>
+      </section>
+
+      <section>
+        <h2>Serializable: Correct or Retry</h2>
+        <p>PostgreSQL Serializable isolation emulates serial execution for committed transactions. It does not mean every transaction succeeds. It means the database may abort one transaction when the concurrent pattern cannot be proven equivalent to a safe serial order.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Choice</th>
+              <th>What it buys</th>
+              <th>What it costs</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Serializable transaction</td>
+              <td>Cross-row business rules can be protected without manually locking every predicate.</td>
+              <td>The app must retry the whole transaction after serialization failure.</td>
+            </tr>
+            <tr>
+              <td>Short transaction body</td>
+              <td>Less time for conflicts, locks, and stale decisions to accumulate.</td>
+              <td>You must keep network calls, user waits, and slow work outside the boundary.</td>
+            </tr>
+            <tr>
+              <td>Generic retry handler</td>
+              <td>Deadlocks and serialization conflicts become expected control flow.</td>
+              <td>The transaction body must be idempotent from the caller's point of view.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>The retry boundary matters. If a transaction fails with a serialization error, retry the whole transaction from the beginning so it reads a new consistent view. Retrying only the last statement can reuse a decision made from a snapshot the database has already rejected.</p>
+      </section>
+
+      <section>
+        <h2>Locks: Make the Conflict Concrete</h2>
+        <p><code>SELECT FOR UPDATE</code> locks the rows returned by a query as though they are about to be updated. Other transactions that try to update, delete, or acquire conflicting locks on those rows must wait until the transaction ends.</p>
+        <div class="principle">
+          <p><strong>Useful pattern:</strong> lock the smallest row that represents the contested resource.</p>
+          <pre><code>BEGIN;
+
+SELECT *
+FROM merchant_limits
+WHERE merchant_id = $1
+FOR UPDATE;
+
+-- Now recalculate and update related rows while every
+-- conflicting limit change queues behind the same row.
+
+COMMIT;</code></pre>
+        </div>
+        <p>Row locks do not block ordinary reads. They block conflicting writers and lockers. The operational cost is waiting and possible deadlocks. Acquire locks in a consistent order, keep transactions short, and do not hold locks while waiting on an external API, human input, or a long computation.</p>
+      </section>
+
+      <section>
+        <h2>Outbox and Isolation Belong Together</h2>
+        <p>The transactional outbox from <a href="0002-safe-writes-idempotency-and-outbox.html">Lesson 0002</a> only works if the state change and the event row commit in the same database transaction. Isolation decides whether the state change itself was valid under concurrency.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Question</th>
+              <th>Weak answer</th>
+              <th>Stronger answer</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Can duplicate requests reserve twice?</td>
+              <td>App server checks an in-memory request cache.</td>
+              <td>Unique idempotency key in the database.</td>
+            </tr>
+            <tr>
+              <td>Can inventory go negative?</td>
+              <td>Read quantity, subtract in code, write back later.</td>
+              <td>Conditional update that succeeds only when enough stock remains.</td>
+            </tr>
+            <tr>
+              <td>Can event publish without state?</td>
+              <td>Commit state, then call Kafka directly.</td>
+              <td>Write outbox row in the same transaction, then publish asynchronously.</td>
+            </tr>
+            <tr>
+              <td>Can retries double-publish?</td>
+              <td>Assume the worker runs once.</td>
+              <td>Outbox event id plus idempotent consumer or producer behavior.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Observe Contention as a Correctness Signal</h2>
+        <p>Concurrency bugs are not only logical. They have operational fingerprints. A healthy system can have some waiting and retries. A struggling system shows rising waits, aborts, long transactions, deadlocks, and retry storms.</p>
+        <div class="flow">
+          <div><strong>Lock waits</strong>Which query and relation block progress?</div>
+          <div><strong>Deadlocks</strong>Which code paths acquire locks in different orders?</div>
+          <div><strong>40001</strong>Can serialization retries eventually succeed?</div>
+          <div><strong>Duration</strong>Which transactions hold state too long?</div>
+          <div><strong>Conflicts</strong>Are idempotency and uniqueness conflicts expected?</div>
+        </div>
+        <p>In an interview or design review, metrics make the answer credible. "We used Serializable" is incomplete. "We used Serializable for this cross-row invariant, retried SQLSTATE 40001 at the transaction boundary, and watched serialization failures, retry success rate, and transaction duration" is a production answer.</p>
+      </section>
+
+      <section>
+        <h2>How to Defend the Resume Bullet</h2>
+        <p>Suppose someone asks: "How did you prevent duplicate billing or overselling when requests retried and multiple workers ran concurrently?" A strong answer names the invariant and the database mechanism.</p>
+        <div class="principle">
+          <p><strong>Strong answer shape:</strong></p>
+          <ol>
+            <li>Each externally retried operation carried an idempotency key, enforced by a unique constraint in PostgreSQL.</li>
+            <li>Single-row inventory or balance changes used conditional updates so the invariant lived in the SQL statement, not only in application memory.</li>
+            <li>Cross-row rules used Serializable transactions with whole-transaction retries, or a concrete guard row locked with <code>SELECT FOR UPDATE</code>.</li>
+            <li>The outbox event was inserted in the same transaction as the authoritative state change.</li>
+            <li>Consumers were idempotent, so outbox publish retries could not double-apply downstream side effects.</li>
+            <li>We monitored lock waits, deadlocks, serialization failures, retry success, duplicate-key conflicts, and transaction duration.</li>
+          </ol>
+        </div>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. In PostgreSQL Read Committed, what gets a fresh snapshot?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. In Read Committed, each statement sees a snapshot from that statement's start.">each SQL statement</button>
+            <button data-correct="false" data-why="">each full transaction</button>
+            <button data-correct="false" data-why="">each database cluster</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. What should protect duplicate idempotency keys?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">process memory cache</button>
+            <button data-correct="true" data-why="Correct. A unique database constraint arbitrates duplicates across app servers and retries.">unique database constraint</button>
+            <button data-correct="false" data-why="">client timing delay</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. After a serialization failure, what should retry?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">final SQL statement</button>
+            <button data-correct="true" data-why="Correct. The rejected snapshot decision is unsafe, so retry the whole transaction.">entire database transaction</button>
+            <button data-correct="false" data-why="">outbox publisher only</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. What does <code>SELECT FOR UPDATE</code> mainly block?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">ordinary stale readers</button>
+            <button data-correct="false" data-why="">separate table inserts</button>
+            <button data-correct="true" data-why="Correct. Row locks block conflicting updates, deletes, and incompatible row locks.">conflicting row writers</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required. These are the checks that show whether you can reason about concurrent database writes:</p>
+        <ol>
+          <li>What is the difference between "using a transaction" and naming the invariant protected by the transaction?</li>
+          <li>Why is a unique constraint stronger than checking for duplicates in application code?</li>
+          <li>When is a conditional <code>UPDATE</code> better than <code>SELECT</code> then <code>UPDATE</code>?</li>
+          <li>Why can Repeatable Read still be unsafe for cross-row business rules?</li>
+          <li>Why must Serializable failures retry the whole transaction?</li>
+          <li>What should you measure to know whether concurrency control is hurting production?</li>
+        </ol>
+        <div class="callout">
+          <p><strong>Concise answer key:</strong> a transaction boundary is not the same as a correctness argument; constraints arbitrate races inside the authority; conditional updates keep the predicate with the write; snapshot transactions can miss cross-row conflicts; serialization failures reject the whole observed execution; watch waits, aborts, retries, deadlocks, conflicts, and transaction duration.</p>
+        </div>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. Useful concurrency questions here are: "What is the invariant?", "Can a constraint express it?", "What rows are locked?", "What retries the transaction?", and "What metric proves contention is controlled?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://www.postgresql.org/docs/current/transaction-iso.html">PostgreSQL Documentation: Transaction Isolation</a></li>
+          <li><a href="https://www.postgresql.org/docs/current/explicit-locking.html">PostgreSQL Documentation: Explicit Locking</a></li>
+          <li><a href="https://www.postgresql.org/docs/current/ddl-constraints.html">PostgreSQL Documentation: Constraints</a></li>
+          <li><a href="https://www.postgresql.org/docs/current/sql-insert.html">PostgreSQL Documentation: INSERT</a></li>
+          <li><a href="https://dataintensive.net/">Designing Data-Intensive Applications</a></li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
