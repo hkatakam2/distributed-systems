@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: Query Plans, Indexes, and Production Performance</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0011</div>
+        <h1>Query Plans, Indexes, and Production Performance</h1>
+        <p class="lede">A compact guide for turning a slow PostgreSQL query into a defensible performance diagnosis: plan, estimate, access path, index, rollout, and observation.</p>
+      </header>
+
+      <section>
+        <h2>The Recurring Shape</h2>
+        <div class="flow">
+          <div><strong>Query</strong>Capture SQL, parameters, data shape, and latency target.</div>
+          <div><strong>Plan</strong>Read scans, joins, sorts, loops, filters, and row estimates.</div>
+          <div><strong>Cause</strong>Find selectivity, stale stats, missing index, or wrong query shape.</div>
+          <div><strong>Change</strong>Add or adjust index, rewrite query, or refresh statistics.</div>
+          <div><strong>Operate</strong>Roll out safely and watch latency, I/O, writes, locks, and usage.</div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Vocabulary</h2>
+        <p><strong>Query plan:</strong> the tree of operations PostgreSQL chooses to execute a query.</p>
+        <p><strong>Plan node:</strong> one operation in that tree, such as scan, sort, aggregate, hash, or join.</p>
+        <p><strong>Sequential scan:</strong> reading a table directly, often sensible for small tables or queries that need a large fraction of rows.</p>
+        <p><strong>Index scan:</strong> using an index to find rows, then usually fetching matching table rows.</p>
+        <p><strong>Bitmap scan:</strong> collecting row locations through one or more indexes, then visiting the table in a more efficient physical order.</p>
+        <p><strong><code>Index Cond</code>:</strong> a predicate used to navigate or restrict the index access path.</p>
+        <p><strong><code>Filter</code>:</strong> a predicate checked after rows have already been reached by the current node.</p>
+        <p><strong>Row estimate:</strong> the planner's predicted row count. A large estimate-versus-actual mismatch often explains a bad plan.</p>
+        <p><strong><code>loops</code>:</strong> how many times a node ran. Multiply actual time or rows by loops to understand repeated inner work.</p>
+        <p><strong>Selectivity:</strong> the fraction of rows expected to match a predicate.</p>
+        <p><strong>Multicolumn index:</strong> an index over multiple keys, most efficient when the leading columns match the query shape.</p>
+        <p><strong>Partial index:</strong> an index over only rows satisfying a predicate, useful for hot subsets such as open orders or unprocessed jobs.</p>
+        <p><strong>Covering index:</strong> an index with enough key or included columns to answer a query with fewer heap visits, sometimes enabling index-only scans.</p>
+        <p><strong>Statistics:</strong> approximate metadata collected by <code>ANALYZE</code> that helps the planner estimate row counts and choose plans.</p>
+        <p><strong>Bloat:</strong> extra table or index space from churn and dead row versions, increasing I/O and maintenance pressure.</p>
+      </section>
+
+      <section>
+        <h2>Plan Triage Checklist</h2>
+        <ol>
+          <li>Is the slow query the exact SQL shape and parameter set seen in production?</li>
+          <li>Did you run <code>EXPLAIN (ANALYZE, BUFFERS)</code> only where executing the query is safe?</li>
+          <li>Where is the largest time spent: scan, join, sort, aggregate, or repeated loop?</li>
+          <li>Are estimated rows close to actual rows?</li>
+          <li>Does the plan use <code>Index Cond</code> for the selective predicates, or only <code>Filter</code>?</li>
+          <li>Is the query returning a small page with <code>ORDER BY</code> and <code>LIMIT</code>?</li>
+          <li>Can one index satisfy equality filters, ordering, and the limit?</li>
+          <li>Would a partial index cover the hot subset instead of indexing the whole table?</li>
+          <li>Are stale statistics, correlated columns, or skewed values misleading the planner?</li>
+          <li>Will the fix increase write latency, storage, vacuum work, or migration risk?</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Index Choice Table</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Workload shape</th>
+              <th>Likely tool</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Lookup one entity by stable identity.</td>
+              <td>Primary key or unique B-tree index.</td>
+              <td>The key narrows to one or very few rows and also protects identity correctness.</td>
+            </tr>
+            <tr>
+              <td>Filter by tenant, then page recent rows.</td>
+              <td>Multicolumn index such as <code>(tenant_id, created_at DESC)</code>.</td>
+              <td>The leading equality narrows the tenant; the next key provides the desired order.</td>
+            </tr>
+            <tr>
+              <td>Only a small active subset is queried constantly.</td>
+              <td>Partial index with a predicate such as <code>WHERE status = 'open'</code>.</td>
+              <td>The hot index stays smaller and avoids maintaining entries for cold rows.</td>
+            </tr>
+            <tr>
+              <td>Query needs narrow output columns from a hot path.</td>
+              <td><code>INCLUDE</code> columns if they are small and stable.</td>
+              <td>A covering index can reduce heap visits, but duplicates data and can bloat writes.</td>
+            </tr>
+            <tr>
+              <td>Planner badly misestimates correlated predicates.</td>
+              <td>Fresh <code>ANALYZE</code> or extended statistics.</td>
+              <td>An index cannot fix a plan if the planner chooses poorly because its inputs are wrong.</td>
+            </tr>
+            <tr>
+              <td>Writes dominate and reads are broad scans.</td>
+              <td>Fewer indexes, better query shape, or different serving model.</td>
+              <td>Each index adds write, storage, and maintenance cost.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Production Checklist</h2>
+        <ol>
+          <li>Name the endpoint, query, table size, cardinalities, and latency target.</li>
+          <li>Capture a before plan with production-like data.</li>
+          <li>Explain why the current plan is slow in terms of rows, loops, buffers, sorts, or joins.</li>
+          <li>Design the smallest index that matches the query's stable predicates and ordering.</li>
+          <li>Use <code>CREATE INDEX CONCURRENTLY</code> for large live tables when avoiding write blocking matters.</li>
+          <li>Schedule heavy builds with I/O headroom and monitor progress, locks, replication lag, and write latency.</li>
+          <li>Refresh or validate statistics after major data distribution changes.</li>
+          <li>Compare before and after plans and p95/p99 latency.</li>
+          <li>Track index usage and remove unused or redundant indexes only after evidence.</li>
+          <li>Keep the rollback plan simple: drop the new index if it hurts writes or the planner chooses poorly.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Answer Shape</h2>
+        <div class="principle">
+          <p><strong>When defending a database performance fix:</strong></p>
+          <ol>
+            <li>Name the user-facing symptom and the exact query path.</li>
+            <li>Read the plan: scan type, joins, sorts, filters, estimates, actual rows, loops, and buffers.</li>
+            <li>Explain why the old plan was expensive.</li>
+            <li>Explain why the new index or query shape matches the workload.</li>
+            <li>State the production cost: write overhead, storage, lock behavior, and maintenance.</li>
+            <li>State the rollout and proof: concurrent build, monitoring, before/after plan, and latency change.</li>
+          </ol>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
