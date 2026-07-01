@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0009: Replication, Quorums, and Consistency</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0009</div>
+        <h1>Replication, Quorums, and Consistency</h1>
+        <p class="lede">The ninth mental model: replicated state is a promise, not a copy. A backend engineer must know which replicas can accept writes, which reads are fresh enough, and what the system does when replicas disagree.</p>
+        <p class="compact">Mission link: this is the judgment behind PostgreSQL replicas, Spanner-like databases, Dynamo-style key-value stores, Redis/materialized reads, inventory correctness, billing projections, and incident explanations about stale or divergent data.</p>
+      </header>
+
+      <section>
+        <h2>Where This Fits</h2>
+        <p><a href="0008-deployment-safety-rollouts-schema-and-rollbacks.html">Lesson 0008</a> treated production change as a compatibility problem. This lesson treats production state as a failure problem: machines, zones, regions, and networks fail, but users still expect data to be durable, available, and not misleading.</p>
+        <p>Keep <a href="../reference/0009-replication-quorums-and-consistency.html">Reference 0009: Replication, Quorums, and Consistency</a> nearby. It is the compressed decision sheet for this lesson.</p>
+      </section>
+
+      <section>
+        <h2>Concise Answers From Lesson 0008</h2>
+        <ol>
+          <li><strong>Pods running is not enough:</strong> users can still see higher latency, wrong data, stale caches, bad events, or broken domain outcomes.</li>
+          <li><strong>Feature flag value:</strong> deployment puts code in production; release exposes behavior to a tenant, cohort, region, or user group.</li>
+          <li><strong>Rolling update compatibility:</strong> old and new code may share rows, events, cache payloads, config, and API shapes at the same time.</li>
+          <li><strong>Expand and contract:</strong> add compatible structure first, switch writes and reads gradually, then remove old structure only after rollback is unnecessary.</li>
+          <li><strong>Roll forward case:</strong> rolling forward can be safer when schema, data, or events have already moved beyond what old code understands.</li>
+          <li><strong>Canary decision signals:</strong> compare latency, errors, saturation, freshness, and correctness by version, cohort, and dependency.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>The Big Idea</h2>
+        <p>Replication creates multiple copies of state so the system can survive hardware failure, zone failure, regional distance, maintenance, and load. But more copies create a harder question: when two copies disagree, which answer should the system believe?</p>
+        <p>The <a href="https://research.google/pubs/the-google-file-system/">Google File System paper</a> frames replication as a response to commodity-machine failure. The <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo paper</a> shows a high-availability design that uses configurable <code>N</code>, <code>R</code>, and <code>W</code> values, object versioning, sloppy quorum, hinted handoff, and conflict reconciliation. The <a href="https://cloud.google.com/spanner/docs/replication">Spanner replication docs</a> describe a different choice: synchronous, Paxos-based replication with leaders, voting replicas, and write quorums. The <a href="https://cloud.google.com/spanner/docs/true-time-external-consistency">Spanner consistency docs</a> explain the stronger user contract: externally consistent transactions and strong reads.</p>
+        <div class="map">
+          <p><strong>Replication decision path:</strong></p>
+          <pre><code>business invariant
+  -> acceptable stale-read window
+  -> write availability requirement
+  -> conflict mergeability
+  -> replica topology
+  -> commit rule
+  -> read rule
+  -> repair and observability plan</code></pre>
+        </div>
+        <p>The practical skill is not memorizing a consistency model name. It is matching the data boundary to the failure behavior the business can survive.</p>
+      </section>
+
+      <section>
+        <h2>Scenario: Inventory And Billing State</h2>
+        <p>Your resume has two useful examples: inventory availability at Flipkart and billing metrics at Stripe. These look similar because both are replicated state, but their correctness contracts differ.</p>
+        <div class="flow">
+          <div><strong>Inventory reserve</strong>Do not sell the last unit twice.</div>
+          <div><strong>Billing ledger</strong>Do not invent or lose money.</div>
+          <div><strong>MRR dashboard</strong>Show recent enough metrics.</div>
+          <div><strong>Redis cache</strong>Serve fast derived reads.</div>
+          <div><strong>Event replay</strong>Repair projections deterministically.</div>
+        </div>
+        <p>For inventory reservation or a billing ledger, rejecting writes during a partition may be correct because accepting conflicting writes can violate a hard invariant. For an MRR dashboard, a labeled stale answer may be acceptable if it is within the product's freshness contract and can be rebuilt from source events.</p>
+      </section>
+
+      <section>
+        <h2>Two Questions Before Any Replica Design</h2>
+        <p>Every replicated system answers two questions, whether the product admits it or not.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Question</th>
+              <th>Strong-leaning answer</th>
+              <th>Availability-leaning answer</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>When is a write successful?</td>
+              <td>After a leader or majority has ordered and durably accepted it.</td>
+              <td>After any reachable coordinator accepts it, with later repair.</td>
+            </tr>
+            <tr>
+              <td>Who can answer a read?</td>
+              <td>A leader, a quorum, or a replica proven to include recent commits.</td>
+              <td>A nearby replica, cache, or older snapshot with staleness allowed.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>Neither column is morally better. The strong answer protects invariants but may reject work when a quorum is unavailable. The available answer keeps serving but pushes complexity into versioning, conflict resolution, and user-visible staleness.</p>
+      </section>
+
+      <section>
+        <h2>N, R, and W: The Quorum Dial</h2>
+        <p>In Dynamo-style notation, <code>N</code> is the intended replica count for a key, <code>W</code> is the number of replicas that must acknowledge a write, and <code>R</code> is the number of replicas consulted for a read. A common intuition is <code>R + W &gt; N</code>: the read set and write set should overlap.</p>
+        <div class="principle">
+          <p><strong>Example:</strong></p>
+          <pre><code>N = 3 replicas
+W = 2 acknowledgements for a successful write
+R = 2 responses for a successful read
+
+R + W = 4, which is greater than N = 3.
+Under stable membership, the read should contact at least one replica
+that saw the latest successful write.</code></pre>
+        </div>
+        <p>That overlap is useful, but it is not magic. Real systems still need clear membership, version metadata, failure detection, conflict handling, repair, and a policy for slow or unreachable replicas. Dynamo deliberately chooses availability under some failures, then exposes versioning and reconciliation to deal with divergent histories.</p>
+      </section>
+
+      <section>
+        <h2>Strong Replication: Majority Before Success</h2>
+        <p>Spanner represents the other side of the design space. Its docs describe synchronous, Paxos-based replication where voting replicas vote on each write before commit. Within each replica set, a leader handles writes, and a write commits when a majority of voting replicas agree.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Choice</th>
+              <th>What it buys</th>
+              <th>What it costs</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Leader orders writes</td>
+              <td>One authority sequences conflicting writes.</td>
+              <td>Write latency depends on leader placement and failover.</td>
+            </tr>
+            <tr>
+              <td>Majority commit</td>
+              <td>A committed write survives one replica failure in a three-voter group.</td>
+              <td>Writes pause when no majority can form.</td>
+            </tr>
+            <tr>
+              <td>Strong reads</td>
+              <td>Readers observe the committed state promised by the system.</td>
+              <td>Non-leader reads may need coordination.</td>
+            </tr>
+            <tr>
+              <td>Stale reads</td>
+              <td>Nearby replicas can serve older versions faster.</td>
+              <td>The caller must tolerate the timestamp being older.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>The senior judgment is recognizing why a database may intentionally reject a write during a partition. If accepting the write could violate money, inventory, auth, or ordering invariants, unavailability is the safer failure mode.</p>
+      </section>
+
+      <section>
+        <h2>Eventual Consistency: Availability With A Repair Bill</h2>
+        <p>Eventual consistency is not "random correctness." It is a contract: replicas may disagree temporarily, and the system must converge later through propagation, read repair, anti-entropy, replay, or application-level reconciliation.</p>
+        <div class="map">
+          <pre><code>client writes preference in region A
+  -> local replica accepts quickly
+  -> region B may still show old preference
+  -> background replication catches up
+  -> conflict resolver handles concurrent edits
+  -> metrics prove lag and conflicts are bounded</code></pre>
+        </div>
+        <p>This is reasonable when the business operation is mergeable, reversible, or not safety-critical. It is dangerous when two accepted writes can both look valid locally while violating a global invariant.</p>
+      </section>
+
+      <section>
+        <h2>Caches And Projections Are Replicas Too</h2>
+        <p>The Redis materialization layer from earlier lessons is a derived replica of source events. It is fast because it is specialized, but it should not silently pretend to be the source of truth.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Derived state</th>
+              <th>Correctness contract</th>
+              <th>Operational control</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Redis dashboard cache</td>
+              <td>Fresh within a defined age, such as "as of 10:31:04".</td>
+              <td>TTL, versioned keys, fallback, invalidation, freshness metric.</td>
+            </tr>
+            <tr>
+              <td>Flink projection</td>
+              <td>Deterministically rebuildable from Kafka offsets and source events.</td>
+              <td>Checkpointing, replay, idempotent upserts, drift checks.</td>
+            </tr>
+            <tr>
+              <td>Search index</td>
+              <td>Eventually includes committed source records.</td>
+              <td>Index lag, dead-letter handling, backfill, reconciliation.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>A useful production answer names the authority. If the cache lies, what truth source corrects it? If the projection drifts, what replay or rebuild restores it?</p>
+      </section>
+
+      <section>
+        <h2>How To Defend The Resume Bullet</h2>
+        <p>Suppose someone asks: "How did you keep inventory or billing data correct with distributed caches and streams?" A strong answer separates authoritative writes from derived reads.</p>
+        <div class="principle">
+          <p><strong>Strong answer shape:</strong></p>
+          <ol>
+            <li>For hard invariants such as inventory reservation or billing facts, writes went through an authoritative store with transactional or quorum-backed durability.</li>
+            <li>Redis and dashboard projections were treated as derived replicas, not as the authority for money or stock ownership.</li>
+            <li>Each derived record carried version, source offset, or as-of metadata so stale answers could be detected and bounded.</li>
+            <li>Stream consumers used idempotent upserts and replay-safe version guards so retries or replays could not move state backward.</li>
+            <li>Freshness, consumer lag, drift, conflict count, and rebuild progress were monitored as correctness signals, not just performance signals.</li>
+            <li>During incidents, the system could degrade to a labeled stale read, fall back to source truth, pause unsafe consumers, or rebuild the projection from the log.</li>
+          </ol>
+        </div>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. What does W mean?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. W is the required write acknowledgements before success.">required write replicas</button>
+            <button data-correct="false" data-why="">required read replicas</button>
+            <button data-correct="false" data-why="">total replica count</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. What protects a hard invariant during a partition?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">accept every write</button>
+            <button data-correct="true" data-why="Correct. Rejecting unsafe writes can be the right choice when no quorum can protect the invariant.">reject unsafe writes</button>
+            <button data-correct="false" data-why="">ignore stale reads</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. What is the main cost of eventual consistency?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">mandatory global locks</button>
+            <button data-correct="false" data-why="">single leader only</button>
+            <button data-correct="true" data-why="Correct. Eventual systems may serve stale or divergent data until replication and repair converge.">possible stale reads</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. Why can read-only replicas improve latency?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. A nearby replica can serve stale reads without the full strong-read coordination path.">serve nearby stale reads</button>
+            <button data-correct="false" data-why="">raise every write quorum</button>
+            <button data-correct="false" data-why="">delete leader elections entirely</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required. These are the checks that show whether you can reason about replicated state:</p>
+        <ol>
+          <li>Why does adding replicas improve durability but complicate reads?</li>
+          <li>When is rejecting a write better than accepting it?</li>
+          <li>Why is <code>R + W &gt; N</code> useful but not a complete correctness proof?</li>
+          <li>Which data in your resume examples can safely be stale, and which cannot?</li>
+          <li>What metadata would you attach to a materialized dashboard record to make staleness visible?</li>
+          <li>What metrics would prove a derived replica is converging after an incident?</li>
+        </ol>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. Useful replication questions here are: "Who is the authority?", "What makes the write committed?", "Can readers tolerate staleness?", "Can conflicts be merged?", and "How do we prove replicas converged?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://research.google/pubs/the-google-file-system/">Google Research: The Google File System</a></li>
+          <li><a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a></li>
+          <li><a href="https://cloud.google.com/spanner/docs/replication">Google Cloud Spanner Documentation: Replication</a></li>
+          <li><a href="https://cloud.google.com/spanner/docs/true-time-external-consistency">Google Cloud Spanner Documentation: TrueTime and external consistency</a></li>
+          <li><a href="https://research.google/pubs/spanner-googles-globally-distributed-database/">Google Research: Spanner: Google's Globally Distributed Database</a></li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
