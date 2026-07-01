@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: Reliability Controls Checklist</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0007</div>
+        <h1>Reliability Controls Checklist</h1>
+        <p class="lede">A compact guide for choosing timeouts, retries, backoff, circuit breakers, bulkheads, load shedding, and graceful degradation across backend service boundaries.</p>
+      </header>
+
+      <section>
+        <h2>The Recurring Shape</h2>
+        <div class="flow">
+          <div><strong>Budget</strong>Every request has a finite time budget.</div>
+          <div><strong>Retry</strong>Retry only safe transient failures with limits.</div>
+          <div><strong>Spread</strong>Backoff and jitter prevent synchronized pressure.</div>
+          <div><strong>Isolate</strong>Bulkheads keep one failure from consuming all capacity.</div>
+          <div><strong>Degrade</strong>Serve a smaller honest result before full collapse.</div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Control Selection</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Problem</th>
+              <th>Control</th>
+              <th>Common trap</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>A dependency is slow or never responds.</td>
+              <td>Deadline or timeout with cancellation.</td>
+              <td>Letting callers wait until queues and threads are exhausted.</td>
+            </tr>
+            <tr>
+              <td>A transient failure may succeed soon.</td>
+              <td>Retry with bounded attempts.</td>
+              <td>Retrying unsafe writes without idempotency or retrying forever.</td>
+            </tr>
+            <tr>
+              <td>Many clients retry at the same time.</td>
+              <td>Exponential backoff plus jitter.</td>
+              <td>Creating a synchronized retry storm after an outage.</td>
+            </tr>
+            <tr>
+              <td>A dependency is repeatedly failing.</td>
+              <td>Circuit breaker with half-open probes.</td>
+              <td>Continuing to spend capacity on calls expected to fail.</td>
+            </tr>
+            <tr>
+              <td>One path can consume shared resources.</td>
+              <td>Bulkhead pools, queue limits, or concurrency limits.</td>
+              <td>Using one global pool for critical and optional work.</td>
+            </tr>
+            <tr>
+              <td>Load exceeds service capacity.</td>
+              <td>Backpressure, load shedding, quotas, or admission control.</td>
+              <td>Accepting work that cannot finish before its deadline.</td>
+            </tr>
+            <tr>
+              <td>The full response cannot be built reliably.</td>
+              <td>Graceful degradation with an explicit contract.</td>
+              <td>Failing the whole request because an optional feature failed.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Vocabulary</h2>
+        <p><strong>Deadline:</strong> an absolute time by which the caller no longer wants the result.</p>
+        <p><strong>Timeout:</strong> a maximum wait for one operation or phase, such as connect, request, or read.</p>
+        <p><strong>Retry budget:</strong> a limit on how many retry attempts a caller may spend so retries do not dominate traffic.</p>
+        <p><strong>Backoff:</strong> increasing delay between retry attempts after repeated failures.</p>
+        <p><strong>Jitter:</strong> randomness added to retry delays so clients do not retry in synchronized waves.</p>
+        <p><strong>Circuit breaker:</strong> a stateful guard that fails fast when a dependency appears unhealthy, then probes for recovery.</p>
+        <p><strong>Bulkhead:</strong> isolated capacity for a dependency, tenant, priority, or feature so one overload stays contained.</p>
+        <p><strong>Backpressure:</strong> a signal or limit that slows producers when consumers cannot keep up.</p>
+        <p><strong>Load shedding:</strong> intentionally rejecting lower-priority work when accepting it would hurt more important work.</p>
+        <p><strong>Graceful degradation:</strong> returning a smaller, older, or less personalized result while preserving the core user contract.</p>
+      </section>
+
+      <section>
+        <h2>Design Checklist</h2>
+        <ol>
+          <li>What user-visible deadline does this request need to meet?</li>
+          <li>How much of that budget can this dependency spend?</li>
+          <li>Is the operation safe to retry? What makes duplicate attempts harmless?</li>
+          <li>How many retries are allowed, and where is the retry budget enforced?</li>
+          <li>Is backoff jittered so clients spread out after failure?</li>
+          <li>What happens when the dependency is clearly unhealthy?</li>
+          <li>Which resources are isolated for critical, optional, tenant, or dependency-specific work?</li>
+          <li>Which work is shed first under overload?</li>
+          <li>What degraded response is honest and useful?</li>
+          <li>Which metrics prove the control is helping instead of hiding a worse failure?</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Metric Checklist</h2>
+        <ul>
+          <li>Deadline exceeded count and timeout rate by dependency.</li>
+          <li>Retry attempts per original request and retry success rate.</li>
+          <li>Retry budget exhausted count.</li>
+          <li>Circuit breaker state changes, open duration, and probe results.</li>
+          <li>Pool saturation, queue depth, queue age, and rejected work.</li>
+          <li>Degraded response rate by feature and priority class.</li>
+          <li>User-visible latency, errors, freshness, and correctness after degradation.</li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
