@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: Deployment Safety Checklist</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0008</div>
+        <h1>Deployment Safety Checklist</h1>
+        <p class="lede">A compact guide for shipping backend code, configuration, schema, stream jobs, and cache changes without turning one bad change into a broad outage.</p>
+      </header>
+
+      <section>
+        <h2>The Recurring Shape</h2>
+        <div class="flow">
+          <div><strong>Artifact</strong>Build one immutable version you can identify and roll back.</div>
+          <div><strong>Compatible</strong>Make old and new code tolerate shared data and messages.</div>
+          <div><strong>Rollout</strong>Expose the change gradually with readiness gates and small blast radius.</div>
+          <div><strong>Verify</strong>Watch user symptoms, internal causes, and domain correctness.</div>
+          <div><strong>Recover</strong>Rollback or roll forward with a plan for code, config, data, and schema.</div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Change Plane Checklist</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Plane</th>
+              <th>Safe question</th>
+              <th>Common trap</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Code artifact</td>
+              <td>Can we identify the exact image, commit, build, and dependency set?</td>
+              <td>Mutable tags, unknown library drift, or manual server edits.</td>
+            </tr>
+            <tr>
+              <td>Configuration</td>
+              <td>Can config be changed, audited, and reverted separately from code?</td>
+              <td>A config flip that changes behavior globally with no owner or metric.</td>
+            </tr>
+            <tr>
+              <td>Schema</td>
+              <td>Can old and new code both run while this schema exists?</td>
+              <td>Deploying code that requires a column before every pod sees the schema.</td>
+            </tr>
+            <tr>
+              <td>Data and backfill</td>
+              <td>Can backfill run in batches, pause, resume, and avoid side effects?</td>
+              <td>One huge migration that locks hot tables or emits duplicate events.</td>
+            </tr>
+            <tr>
+              <td>Traffic</td>
+              <td>Can we limit exposure by pod, tenant, region, or feature cohort?</td>
+              <td>Sending 100 percent of traffic to a new path before observing it.</td>
+            </tr>
+            <tr>
+              <td>Telemetry</td>
+              <td>Can we tell whether the change improved, broke, or hid behavior?</td>
+              <td>Calling the deploy successful because pods are running.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Kubernetes Rollout Checks</h2>
+        <ol>
+          <li>Does the Deployment use an immutable image tag or digest?</li>
+          <li>Does the pod template change intentionally trigger a new rollout?</li>
+          <li>Are <code>maxSurge</code> and <code>maxUnavailable</code> chosen for the service's real capacity headroom?</li>
+          <li>Does the readiness probe prove the pod can serve the traffic it is about to receive?</li>
+          <li>Is the liveness probe only for states that are better fixed by restart?</li>
+          <li>Does a slow-starting app use a startup probe or conservative initial delay?</li>
+          <li>Is there a progress deadline or rollout monitor that catches stuck deployments?</li>
+          <li>Are new pods compared against old pods for latency, errors, saturation, freshness, and correctness?</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Expand And Contract Schema Changes</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Step</th>
+              <th>Purpose</th>
+              <th>Risk to avoid</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Expand</td>
+              <td>Add nullable columns, new tables, new topics, or optional fields.</td>
+              <td>Breaking old code that still ignores or lacks the new shape.</td>
+            </tr>
+            <tr>
+              <td>Write both</td>
+              <td>Make new code populate old and new representations.</td>
+              <td>Creating a split-brain period where reads disagree silently.</td>
+            </tr>
+            <tr>
+              <td>Backfill</td>
+              <td>Fill historical data in bounded, observable batches.</td>
+              <td>Locking, saturating I/O, or replaying business side effects.</td>
+            </tr>
+            <tr>
+              <td>Switch reads</td>
+              <td>Move readers to the new path behind a flag or small cohort.</td>
+              <td>Global cutover before drift and latency are measured.</td>
+            </tr>
+            <tr>
+              <td>Contract</td>
+              <td>Drop old fields only after no code, jobs, dashboards, or exports need them.</td>
+              <td>Making rollback impossible because the old representation is gone.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Rollback Checklist</h2>
+        <ol>
+          <li>What exact symptom or threshold triggers rollback?</li>
+          <li>Is the bad change code, config, schema, data, traffic routing, or a dependency?</li>
+          <li>Can the old code read data written by the new code?</li>
+          <li>Can the old consumers handle messages emitted by the new producers?</li>
+          <li>Will rollback re-run non-idempotent work such as payments, emails, or webhooks?</li>
+          <li>Does rollback require disabling a feature flag before reverting the image?</li>
+          <li>Does rollback require cache invalidation, replay, or projection rebuild?</li>
+          <li>What evidence proves recovery: user symptoms, dependency health, and domain correctness?</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Vocabulary</h2>
+        <p><strong>Deployment:</strong> putting a specific build or configuration into an environment.</p>
+        <p><strong>Release:</strong> exposing behavior to users; release can happen after deployment when a flag is enabled.</p>
+        <p><strong>Rollout:</strong> gradual replacement or exposure of one version with another.</p>
+        <p><strong>Canary:</strong> a small, observed cohort that receives a change before broad release.</p>
+        <p><strong>Readiness probe:</strong> a health check that controls whether a pod receives service traffic.</p>
+        <p><strong>Liveness probe:</strong> a health check that restarts a container when restart is the right recovery action.</p>
+        <p><strong>Startup probe:</strong> a health check that gives slow-starting containers time before liveness begins.</p>
+        <p><strong>Feature flag:</strong> a runtime decision point that separates deploying code from releasing behavior.</p>
+        <p><strong>Expand and contract:</strong> a migration pattern that adds compatible structure first, moves traffic gradually, and removes old structure later.</p>
+        <p><strong>Rollback:</strong> returning to a previous known-good state.</p>
+        <p><strong>Roll forward:</strong> fixing production by shipping a new change when rollback is unsafe or insufficient.</p>
+      </section>
+    </main>
+  </body>
+</html>
