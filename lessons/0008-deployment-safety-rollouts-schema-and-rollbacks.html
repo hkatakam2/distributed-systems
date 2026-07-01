@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0008: Deployment Safety, Rollouts, Schema Changes, and Rollbacks</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0008</div>
+        <h1>Deployment Safety: Rollouts, Schema Changes, and Rollbacks</h1>
+        <p class="lede">The eighth mental model: deployment is controlled change. A production engineer does not merely push code; they manage artifact identity, compatibility, traffic exposure, health gates, observability, and recovery.</p>
+        <p class="compact">Mission link: this is the practical layer behind Kubernetes, CI/CD, schema migrations, feature flags, incident rollback, and defending how a backend system changes safely while serving real users.</p>
+      </header>
+
+      <section>
+        <h2>Where This Fits</h2>
+        <p><a href="0007-reliability-controls-timeouts-retries-and-degradation.html">Lesson 0007</a> explained runtime controls for dependency failure and overload. This lesson asks the adjacent production question: how do you introduce a new version without creating the failure yourself?</p>
+        <p>Keep <a href="../reference/0008-deployment-safety.html">Reference 0008: Deployment Safety Checklist</a> nearby. It is the compressed decision sheet for this lesson.</p>
+      </section>
+
+      <section>
+        <h2>Concise Answers From Lesson 0007</h2>
+        <ol>
+          <li><strong>Deadline versus timeout:</strong> a deadline carries the remaining user budget across the whole call chain; local timeouts can overspend the total budget.</li>
+          <li><strong>Safe write retry:</strong> retry only when duplicate execution is harmless through idempotency keys, event IDs, version guards, or a read-only operation.</li>
+          <li><strong>Backoff and jitter:</strong> backoff slows repeated attempts, and jitter spreads clients so recovery is not hit by synchronized retry waves.</li>
+          <li><strong>Optional dependency down:</strong> fail fast or open the breaker, then serve the core dashboard with an honest degraded response.</li>
+          <li><strong>Bulkhead targets:</strong> isolate checkout writes from dashboard reads, projection workers from webhook delivery, tenants from one another, and optional features from core paths.</li>
+          <li><strong>Retries worsening outage:</strong> watch retry attempts per original request, retry budget exhaustion, dependency saturation, tail latency, errors, and recovery time.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>The Big Idea</h2>
+        <p>A deploy is not one change. It is several change planes moving together: code artifact, configuration, schema, data, traffic routing, and telemetry. Most painful rollouts fail because one plane changed faster than the others could tolerate.</p>
+        <p>The <a href="https://kubernetes.io/docs/concepts/workloads/controllers/deployment/">Kubernetes Deployment documentation</a> describes how Deployments manage ReplicaSets and rolling updates. The <a href="https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/">Kubernetes probe guide</a> separates readiness, liveness, and startup checks. PostgreSQL's <a href="https://www.postgresql.org/docs/current/sql-altertable.html">ALTER TABLE</a> and <a href="https://www.postgresql.org/docs/current/sql-createindex.html">CREATE INDEX</a> docs show why database changes need their own rollout thinking. Pete Hodgson's <a href="https://martinfowler.com/articles/feature-toggles.html">feature toggle taxonomy</a> gives a practical way to separate deployment from release.</p>
+        <div class="map">
+          <p><strong>Safe change path:</strong></p>
+          <pre><code>build immutable artifact
+  -> apply backward-compatible schema expansion
+  -> deploy new pods with readiness gates
+  -> expose small cohort or flag
+  -> compare symptoms, causes, and domain correctness
+  -> increase exposure or rollback
+  -> contract old schema only after rollback is no longer needed</code></pre>
+        </div>
+        <p>The engineering skill is to make every step reversible or at least survivable. "Pods are running" is not success. Success means users are still within the contract and the business result is still correct.</p>
+      </section>
+
+      <section>
+        <h2>Scenario: Add Trial Conversion Revenue</h2>
+        <p>Suppose the merchant dashboard needs a new metric: revenue attributed to trials that converted this month. This touches the API response, the stream processor, the PostgreSQL projection, the Redis cache, and dashboard UI expectations.</p>
+        <div class="flow">
+          <div><strong>Schema</strong>Add optional projection field.</div>
+          <div><strong>Stream</strong>Compute new metric from events.</div>
+          <div><strong>API</strong>Return field behind a flag.</div>
+          <div><strong>Cache</strong>Version keys or payload shape.</div>
+          <div><strong>Observe</strong>Compare latency, freshness, and drift.</div>
+        </div>
+        <p>A weak deployment changes all of this at once and hopes. A stronger deployment lets old and new code coexist, limits traffic exposure, and keeps the rollback path alive until the new path has been observed under real load.</p>
+      </section>
+
+      <section>
+        <h2>Separate Deployment From Release</h2>
+        <p>Deployment means the code exists in production. Release means users experience the new behavior. Feature flags, canary cohorts, and config-driven routing let you deploy a new path while keeping most traffic on the old path.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Move</th>
+              <th>What it controls</th>
+              <th>Production judgment</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Deploy image</td>
+              <td>Which code version runs in pods or tasks.</td>
+              <td>Use immutable versions and record commit, build, and config.</td>
+            </tr>
+            <tr>
+              <td>Flip flag</td>
+              <td>Which behavior a request, tenant, region, or cohort sees.</td>
+              <td>Expose the smallest useful slice first, then widen with evidence.</td>
+            </tr>
+            <tr>
+              <td>Change config</td>
+              <td>Runtime parameters such as limits, timeouts, or feature settings.</td>
+              <td>Audit it like code because it can break production just as quickly.</td>
+            </tr>
+            <tr>
+              <td>Run migration</td>
+              <td>Database, topic, cache, or message shape.</td>
+              <td>Design compatibility before code depends on the new shape.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>Kubernetes ConfigMaps are one mechanism for decoupling environment-specific configuration from images, but the deeper principle applies everywhere: when behavior can change without rebuilding code, that behavior needs ownership, review, metrics, and rollback.</p>
+      </section>
+
+      <section>
+        <h2>Kubernetes Rollouts: Replace Pods Gradually</h2>
+        <p>A Deployment creates and manages ReplicaSets. A new rollout is triggered by changing the pod template, such as the container image or template labels. With the default rolling update strategy, Kubernetes gradually scales up new pods and scales down old pods. <code>maxSurge</code> controls how many extra pods can exist during the rollout; <code>maxUnavailable</code> controls how much desired capacity can be unavailable.</p>
+        <div class="principle">
+          <p><strong>What a strong rollout specifies:</strong></p>
+          <ol>
+            <li>Enough replicas and capacity headroom for old and new pods to overlap.</li>
+            <li>A readiness probe that keeps unready pods out of Service traffic.</li>
+            <li>A liveness probe only for states where restart is a useful repair.</li>
+            <li>A startup probe or initial delay for slow-starting containers.</li>
+            <li>A progress deadline or deployment monitor that catches stuck rollouts.</li>
+            <li>Deploy markers in telemetry so symptoms can be compared by version.</li>
+          </ol>
+        </div>
+        <p>The common mistake is to treat liveness as a general health check. If a liveness probe fails because a database is briefly slow, Kubernetes may restart healthy app processes during a dependency incident. Readiness is the gate for traffic. Liveness is for "this container should be restarted."</p>
+      </section>
+
+      <section>
+        <h2>Schema Changes: Expand Before You Depend</h2>
+        <p>Database changes have different failure modes from code changes. <code>ALTER TABLE</code> can require locks, constraints can scan existing data, indexes can add I/O load, and old application versions may still be running while the schema changes. The safest general pattern is expand and contract.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Phase</th>
+              <th>Trial revenue example</th>
+              <th>Rollback value</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Expand</td>
+              <td>Add nullable <code>trial_conversion_revenue_cents</code> to the projection.</td>
+              <td>Old code ignores it; new code can start writing it.</td>
+            </tr>
+            <tr>
+              <td>Write both</td>
+              <td>Stream job writes old dashboard totals and the new metric.</td>
+              <td>Readers can switch back without losing the old representation.</td>
+            </tr>
+            <tr>
+              <td>Backfill</td>
+              <td>Fill historical merchants in bounded batches with pause and resume.</td>
+              <td>Bad batches can stop without corrupting live writes.</td>
+            </tr>
+            <tr>
+              <td>Switch reads</td>
+              <td>API returns the new field for internal users, then a small cohort.</td>
+              <td>Flag can be turned off before reverting the image.</td>
+            </tr>
+            <tr>
+              <td>Contract</td>
+              <td>Remove old compatibility logic after no consumers need it.</td>
+              <td>Done only after rollback to the old path is no longer required.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>For large tables, prefer migration steps that are small, observable, and pauseable. PostgreSQL supports options such as validating some constraints after creation and building indexes concurrently, but every production migration still needs workload-specific review because reduced blocking can mean more total work and more background load.</p>
+      </section>
+
+      <section>
+        <h2>Message And Cache Compatibility</h2>
+        <p>In an event-driven system, schema compatibility is not only a database problem. Old consumers may read new events. New consumers may replay old events. Cache readers may see payloads written by an older code version.</p>
+        <div class="map">
+          <pre><code>new producer emits event_v3
+  old consumer must ignore optional field or route to dead letter safely
+  new consumer must handle missing field during replay of event_v2
+  projection must use version guards so replay cannot move state backward
+  Redis payload should include schema version or use versioned keys</code></pre>
+        </div>
+        <p>The rule is simple: any boundary with independent deploy timing needs compatibility. That includes APIs, events, database rows, cache payloads, files, partner webhooks, and scheduled jobs.</p>
+      </section>
+
+      <section>
+        <h2>Observe The Rollout, Not Just The Pods</h2>
+        <p>A rollout monitor should compare the new version against the old version using the signals from <a href="0006-observability-signals-traces-and-debugging.html">Lesson 0006</a> and the controls from Lesson 0007.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Signal</th>
+              <th>Rollout question</th>
+              <th>Trial revenue example</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Latency</td>
+              <td>Did the new version add request or stream processing time?</td>
+              <td>Dashboard p95 and p99 by version.</td>
+            </tr>
+            <tr>
+              <td>Errors</td>
+              <td>Did exceptions, timeouts, or validation failures rise?</td>
+              <td>API 5xx, consumer failures, projection upsert errors.</td>
+            </tr>
+            <tr>
+              <td>Saturation</td>
+              <td>Did the change consume extra DB, Redis, CPU, or queue capacity?</td>
+              <td>DB locks, I/O, connection pools, consumer lag.</td>
+            </tr>
+            <tr>
+              <td>Freshness</td>
+              <td>Did the new computation delay the dashboard?</td>
+              <td>Projection age and cache age by merchant cohort.</td>
+            </tr>
+            <tr>
+              <td>Correctness</td>
+              <td>Does the new number match source truth?</td>
+              <td>Trial revenue drift checks against billing facts.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>This is where deployment safety becomes operational judgment. You should know before the rollout what metric will stop it, what metric will allow the next cohort, and what metric would require rollback versus roll forward.</p>
+      </section>
+
+      <section>
+        <h2>Rollback Is A System Design Problem</h2>
+        <p>Rollback sounds like "put the old image back." In distributed systems, that is often incomplete. The old image may not understand new rows, new events, new cache payloads, or new config. A rollback plan has to name every plane that changed.</p>
+        <div class="principle">
+          <p><strong>Rollback decision example:</strong></p>
+          <ol>
+            <li>Flag off the new metric first so no more users enter the new read path.</li>
+            <li>Rollback API pods if error rate or latency remains elevated.</li>
+            <li>Pause or rollback stream job if it writes bad projection values.</li>
+            <li>Invalidate affected Redis keys if bad payloads were cached.</li>
+            <li>Keep expanded columns until old and new paths are stable.</li>
+            <li>Run a correction or replay only if the projection data is wrong.</li>
+          </ol>
+        </div>
+        <p>Sometimes rolling forward is safer than rolling back, especially if the schema or data has already moved. Senior judgment is not "always rollback." It is choosing the recovery path with the smallest user impact and the clearest correctness story.</p>
+      </section>
+
+      <section>
+        <h2>How to Defend the Resume Bullet</h2>
+        <p>Suppose someone asks: "How did you deploy backend changes safely?" A strong answer names compatibility, blast radius, health gates, and recovery.</p>
+        <div class="principle">
+          <p><strong>Strong answer shape:</strong></p>
+          <ol>
+            <li>We built immutable artifacts and tied every deploy to a commit, image, config version, and dashboard marker.</li>
+            <li>For schema and event changes, we used expand-and-contract so old and new code could coexist.</li>
+            <li>We deployed through Kubernetes rolling updates with readiness probes, controlled surge and unavailable capacity, and rollout progress monitoring.</li>
+            <li>Risky behavior was released separately through flags or canary cohorts, not exposed globally just because code was deployed.</li>
+            <li>Rollout gates watched user latency, error rate, saturation, freshness, and domain correctness by version or cohort.</li>
+            <li>Rollback plans covered code, config, stream jobs, cache payloads, data correction, and whether the old version could read new data.</li>
+          </ol>
+        </div>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. What does readiness primarily control?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Readiness gates whether a pod receives Service traffic.">Service traffic routing</button>
+            <button data-correct="false" data-why="">Container restart policy</button>
+            <button data-correct="false" data-why="">Database schema locks</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. Which migration phase is safest first?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">Drop old column</button>
+            <button data-correct="true" data-why="Correct. Adding an optional field first lets old and new code coexist.">Add nullable column</button>
+            <button data-correct="false" data-why="">Rewrite all rows</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. What makes a rollout safer?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">Silent global release</button>
+            <button data-correct="false" data-why="">Untracked config changes</button>
+            <button data-correct="true" data-why="Correct. Small observed cohorts limit blast radius and give evidence before broad release.">Small observed cohorts</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. What must rollback include?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">Only image tag</button>
+            <button data-correct="true" data-why="Correct. Real rollback covers every changed plane, including code, config, and data shape.">Code config data</button>
+            <button data-correct="false" data-why="">Just pod count</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required. These are the checks that show whether you can reason about deployment safety:</p>
+        <ol>
+          <li>Why is "pods are running" not enough evidence that a deployment is healthy?</li>
+          <li>How does a feature flag separate deployment from release?</li>
+          <li>What compatibility problems can appear between old and new code during a rolling update?</li>
+          <li>Why does expand-and-contract make database rollback easier?</li>
+          <li>When would rolling forward be safer than rolling back?</li>
+          <li>What signals would you use to decide whether a canary should continue, pause, or rollback?</li>
+        </ol>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. Useful deployment questions here are: "Can old and new versions coexist?", "What changed besides code?", "What limits blast radius?", "What proves correctness?", and "What exactly would rollback do?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://kubernetes.io/docs/concepts/workloads/controllers/deployment/">Kubernetes Documentation: Deployments</a></li>
+          <li><a href="https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/">Kubernetes Documentation: Configure Liveness, Readiness and Startup Probes</a></li>
+          <li><a href="https://kubernetes.io/docs/concepts/configuration/configmap/">Kubernetes Documentation: ConfigMaps</a></li>
+          <li><a href="https://kubernetes.io/docs/concepts/services-networking/service/">Kubernetes Documentation: Service</a></li>
+          <li><a href="https://www.postgresql.org/docs/current/sql-altertable.html">PostgreSQL Documentation: ALTER TABLE</a></li>
+          <li><a href="https://www.postgresql.org/docs/current/sql-createindex.html">PostgreSQL Documentation: CREATE INDEX</a></li>
+          <li><a href="https://martinfowler.com/articles/feature-toggles.html">Feature Toggles (aka Feature Flags) - Pete Hodgson</a></li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
