@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: Transaction Isolation and Concurrency Control</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0010</div>
+        <h1>Transaction Isolation and Concurrency Control</h1>
+        <p class="lede">A compact guide for choosing constraints, locks, isolation levels, and retries when concurrent requests touch the same state.</p>
+      </header>
+
+      <section>
+        <h2>The Recurring Shape</h2>
+        <div class="flow">
+          <div><strong>Invariant</strong>Name what must remain true after commit.</div>
+          <div><strong>Scope</strong>Identify one row, many rows, or many tables.</div>
+          <div><strong>Guard</strong>Choose constraint, conditional update, lock, or serializable check.</div>
+          <div><strong>Retry</strong>Handle duplicate, deadlock, and serialization outcomes.</div>
+          <div><strong>Observe</strong>Track contention, aborts, waits, and drift.</div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Vocabulary</h2>
+        <p><strong>Transaction:</strong> a group of database operations that commits or aborts as a unit.</p>
+        <p><strong>Invariant:</strong> a correctness rule that must remain true, such as no negative inventory or no duplicate idempotency key.</p>
+        <p><strong>Isolation level:</strong> the database contract for what one transaction can observe while other transactions run concurrently.</p>
+        <p><strong>Read Committed:</strong> PostgreSQL's default isolation level; each statement sees a fresh committed snapshot.</p>
+        <p><strong>Repeatable Read:</strong> a transaction-level snapshot in PostgreSQL; successive reads see the same snapshot, but serialization anomalies can still occur.</p>
+        <p><strong>Serializable:</strong> the strictest PostgreSQL isolation level; committed transactions must be equivalent to some serial order, or one transaction aborts.</p>
+        <p><strong>Serialization failure:</strong> an abort that tells the application to retry the whole transaction from the beginning.</p>
+        <p><strong>Row lock:</strong> a lock on selected rows; it blocks conflicting writers and lockers, not ordinary readers.</p>
+        <p><strong><code>SELECT FOR UPDATE</code>:</strong> a locking read that prevents selected rows from being concurrently modified or locked incompatibly until the transaction ends.</p>
+        <p><strong>Write skew:</strong> an anomaly where concurrent transactions each observe a valid snapshot but together commit a state that violates a cross-row rule.</p>
+        <p><strong>Deadlock:</strong> two or more transactions wait for locks held by one another; the database aborts one so progress can resume.</p>
+      </section>
+
+      <section>
+        <h2>Decision Table</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Invariant shape</th>
+              <th>Safer default</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>One row must not go negative.</td>
+              <td>Atomic conditional update: <code>UPDATE ... WHERE available &gt;= needed</code>.</td>
+              <td>The database serializes conflicting row writes and rechecks the predicate.</td>
+            </tr>
+            <tr>
+              <td>One logical request must run once.</td>
+              <td>Unique idempotency key plus <code>ON CONFLICT</code>.</td>
+              <td>The uniqueness check is the concurrency guard, not application memory.</td>
+            </tr>
+            <tr>
+              <td>A fixed row controls a resource.</td>
+              <td><code>SELECT FOR UPDATE</code> on the guard row, then update dependents.</td>
+              <td>Conflicting writers wait on the same concrete lock.</td>
+            </tr>
+            <tr>
+              <td>A cross-row rule must hold.</td>
+              <td>Serializable transaction with whole-transaction retry, or redesign into a constraint or guard row.</td>
+              <td>Snapshot reads alone may not catch write skew.</td>
+            </tr>
+            <tr>
+              <td>Read-only report needs a stable view.</td>
+              <td>Repeatable Read or Serializable Read Only where appropriate.</td>
+              <td>The report should not mix different moments in one answer.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Isolation Cheat Sheet</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Level</th>
+              <th>Snapshot boundary</th>
+              <th>What to remember</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Read Committed</td>
+              <td>Each statement.</td>
+              <td>Fast default; good for simple keyed updates, risky for multi-statement reasoning over changing sets.</td>
+            </tr>
+            <tr>
+              <td>Repeatable Read</td>
+              <td>First statement in the transaction.</td>
+              <td>Stable reads; PostgreSQL prevents phantoms, but serialization anomalies remain possible.</td>
+            </tr>
+            <tr>
+              <td>Serializable</td>
+              <td>Transaction snapshot plus anomaly detection.</td>
+              <td>Strongest contract; design a generic retry path for SQLSTATE <code>40001</code>.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Correctness Checklist</h2>
+        <ol>
+          <li>What exact invariant can concurrent requests break?</li>
+          <li>Can a database constraint express it directly?</li>
+          <li>Can a single conditional statement express it atomically?</li>
+          <li>Which rows, if locked, force all conflicting work through the same gate?</li>
+          <li>Does the transaction read a set and then write based on that set?</li>
+          <li>If using Serializable, does the caller retry the whole transaction after <code>40001</code>?</li>
+          <li>If using explicit locks, are locks acquired in a consistent order?</li>
+          <li>Is the transaction short, with no external network call or user wait inside it?</li>
+          <li>Does the outbox event commit in the same transaction as the state change?</li>
+          <li>What metric proves contention is acceptable?</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Metrics To Watch</h2>
+        <ul>
+          <li>Serialization failure count and retry success rate.</li>
+          <li>Deadlock count and aborted transaction count.</li>
+          <li>Lock wait time by relation, query, and endpoint.</li>
+          <li>Transaction duration and idle-in-transaction sessions.</li>
+          <li>Unique violation rate and idempotency conflict rate.</li>
+          <li>Conditional update miss rate, such as insufficient inventory.</li>
+          <li>Rows locked or updated per transaction.</li>
+          <li>Queue depth for workers using locked rows or <code>SKIP LOCKED</code>.</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2>Answer Shape</h2>
+        <div class="principle">
+          <p><strong>When defending a concurrent write path:</strong></p>
+          <ol>
+            <li>Name the invariant and its scope.</li>
+            <li>Name the database primitive protecting it: constraint, conditional update, lock, or Serializable.</li>
+            <li>Name the expected conflict outcome: wait, no-op, unique violation, deadlock abort, or serialization retry.</li>
+            <li>Name the retry boundary: statement retry for safe idempotent work, whole-transaction retry for serialization failures.</li>
+            <li>Name what is deliberately outside the transaction to keep locks short.</li>
+            <li>Name the metrics that prove contention and correctness are under control.</li>
+          </ol>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
