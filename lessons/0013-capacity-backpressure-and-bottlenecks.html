@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0013: Capacity, Backpressure, and Bottlenecks</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0013</div>
+        <h1>Capacity, Backpressure, and Bottlenecks</h1>
+        <p class="lede">The thirteenth mental model: production performance is not "make everything faster." It is finding the limiting resource, controlling demand, and protecting the user promise when load exceeds some part of the system.</p>
+        <p class="compact">Mission link: this zooms back out across high-throughput APIs, Redis caches, PostgreSQL, Kafka/Flink pipelines, Kubernetes scaling, retries, and incident defense for claims like 10K+ req/sec, 50K+ queries/min, and 5M+ events/day.</p>
+      </header>
+
+      <section>
+        <h2>Where This Fits</h2>
+        <p><a href="0012-online-schema-migrations-and-backfills.html">Lesson 0012</a> was intentionally deep on stored-data change. This lesson returns to the whole system path: when traffic rises, which boundary saturates first, what signal proves it, and what control keeps the system useful?</p>
+        <p>Keep <a href="../reference/0013-capacity-backpressure-and-bottlenecks.html">Reference 0013: Capacity, Backpressure, and Bottlenecks</a> nearby. It is the compressed diagnosis checklist for this lesson.</p>
+      </section>
+
+      <section>
+        <h2>Concise Answers From Lesson 0012</h2>
+        <ol>
+          <li><strong>Migrations are rollouts:</strong> code, schema, data, indexes, replicas, and rollback paths all move on different clocks.</li>
+          <li><strong>Expand first:</strong> old and new code must coexist before readers depend on the new shape.</li>
+          <li><strong>Backfills are writers:</strong> they create WAL, locks, bloat, replica lag, and user-facing risk.</li>
+          <li><strong>Validate before enforcing:</strong> "the job finished" is not the same as "the data is safe to depend on."</li>
+          <li><strong>Contract late:</strong> remove fallback only after old versions and rollback paths no longer need it.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>The Big Idea</h2>
+        <p>Every production path has a capacity story. Requests arrive, each request creates work, work waits behind shared resources, and one boundary eventually becomes the limit. That boundary may be CPU, a database connection pool, a Kafka partition, a Redis hot key, a third-party API, a lock, a stream checkpoint, or a human-owned recovery process.</p>
+        <p>The <a href="https://sre.google/sre-book/handling-overload/">Google SRE chapter on handling overload</a> is the primary source for this lesson because it frames overload as a systems problem: protect critical work, shed less important work, throttle clients, and avoid retry-driven collapse. The same principle appears in <a href="https://grpc.io/docs/guides/deadlines/">gRPC deadlines</a>: callers must stop spending work after the result is no longer useful.</p>
+        <div class="map">
+          <p><strong>Capacity reasoning path:</strong></p>
+          <pre><code>name the user promise
+  -> draw the critical path
+  -> estimate demand and fanout
+  -> find the saturated boundary
+  -> apply backpressure, shedding, caching, batching, or scaling
+  -> verify latency, errors, freshness, saturation, and cost</code></pre>
+        </div>
+        <p>The trap is scaling the visible layer without finding the limiting layer. Doubling API pods can make latency worse if each pod opens more database work than PostgreSQL can serve. Increasing consumer count does not help a Kafka consumer group beyond the number of assignable partitions. Raising retry counts can convert a slow dependency into a full overload event.</p>
+      </section>
+
+      <section>
+        <h2>Scenario: Inventory Availability During Peak Traffic</h2>
+        <p>Suppose an inventory availability API normally serves 2,000 requests per second at 80 ms P95. During a sale event it receives 10,000 requests per second. Each request checks Redis for hot SKU availability, may fall back to PostgreSQL for misses, and emits an availability-check event to Kafka for analytics and reconciliation.</p>
+        <div class="flow">
+          <div><strong>Client</strong>Bursty reads and retries.</div>
+          <div><strong>API</strong>Pods, thread pools, connection pools.</div>
+          <div><strong>Redis</strong>Hot keys, TTLs, memory, misses.</div>
+          <div><strong>Postgres</strong>Source reads, locks, indexes, I/O.</div>
+          <div><strong>Kafka</strong>Events, partitions, lag, consumers.</div>
+        </div>
+        <p>The weak answer is "add more pods." The production answer asks: which part is saturated, what demand is legitimate, and what can be slowed, cached, dropped, or degraded without breaking the product promise?</p>
+      </section>
+
+      <section>
+        <h2>First Estimate: Work Multiplies Across Boundaries</h2>
+        <p>Start with rough math. At 10,000 requests per second, one extra database query per request means 10,000 database queries per second. If Redis hit rate drops from 99 percent to 95 percent, database fallback traffic increases fivefold. If each slow request triggers two client retries, apparent demand can become larger than real user demand.</p>
+        <div class="principle">
+          <p><strong>Useful memory rule:</strong> work in progress is roughly arrival rate times latency.</p>
+          <p>If 10,000 requests per second take 200 ms end to end, about 2,000 requests are in flight. If latency rises to 1 second under the same arrival rate, about 10,000 requests are now in flight. That extra in-flight work consumes threads, memory, queues, sockets, and connection pools.</p>
+        </div>
+        <p>This is why latency is not just a user-experience metric. Rising latency creates more concurrent work, which can cause more waiting, which raises latency again.</p>
+      </section>
+
+      <section>
+        <h2>Find the Bottleneck, Not the Loudest Symptom</h2>
+        <p>The service with the highest error rate is not always the limiting resource. It may be the first place where a downstream limit becomes visible. Use the signal that matches the boundary.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Boundary</th>
+              <th>Useful saturation signal</th>
+              <th>What it usually means</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>API pods</td>
+              <td>CPU, run queue, thread pool wait, request queue depth</td>
+              <td>Per-request work is too expensive or concurrency is too high.</td>
+            </tr>
+            <tr>
+              <td>Connection pool</td>
+              <td>Pool wait time, active connections, timeout count</td>
+              <td>The service is asking the database for more concurrent work than the pool allows.</td>
+            </tr>
+            <tr>
+              <td>PostgreSQL</td>
+              <td>Wait events, locks, I/O, slow queries, index usage</td>
+              <td>The database is the limiting shared resource, not just the caller.</td>
+            </tr>
+            <tr>
+              <td>Redis</td>
+              <td>Hit rate, memory, eviction, hot key latency, command latency</td>
+              <td>The cache may be protecting the source or quietly failing to protect it.</td>
+            </tr>
+            <tr>
+              <td>Kafka consumers</td>
+              <td>Consumer lag, event age, rebalance frequency, processing time</td>
+              <td>Producers are adding work faster than the group can complete it.</td>
+            </tr>
+            <tr>
+              <td>Stream processor</td>
+              <td>Watermark lag, checkpoint duration, backpressure, sink latency</td>
+              <td>State, time, or output sinks are limiting freshness.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>PostgreSQL's <a href="https://www.postgresql.org/docs/current/monitoring-stats.html">monitoring statistics</a> are useful here because database bottlenecks often show up as waits, activity states, table/index pressure, and I/O behavior. Redis's <a href="https://redis.io/docs/latest/develop/reference/eviction/">eviction documentation</a> is a reminder that cache memory pressure and hit/miss behavior are capacity signals, not implementation trivia.</p>
+      </section>
+
+      <section>
+        <h2>Backpressure: Slow the Work Before the Limit Breaks</h2>
+        <p>Backpressure is not failure. It is a deliberate signal that says "this boundary cannot accept unlimited work right now." Without it, queues grow until users see timeouts, memory is exhausted, or retries amplify load.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Situation</th>
+              <th>Bad reflex</th>
+              <th>Better control</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Database pool is full.</td>
+              <td>Increase pool size blindly.</td>
+              <td>Cap concurrency, reduce queries, cache hot reads, and protect write paths.</td>
+            </tr>
+            <tr>
+              <td>Redis misses surge.</td>
+              <td>Let every miss hit PostgreSQL.</td>
+              <td>Coalesce requests, serve bounded stale data, or shed low-priority reads.</td>
+            </tr>
+            <tr>
+              <td>Consumer lag grows.</td>
+              <td>Retry failed events in a tight loop.</td>
+              <td>Use bounded retries, DLQ ownership, pause unsafe partitions, and repair later.</td>
+            </tr>
+            <tr>
+              <td>External dependency slows.</td>
+              <td>Wait forever and retry harder.</td>
+              <td>Use deadlines, jittered backoff, circuit breakers, and degraded responses.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>The skill is choosing what to protect. A checkout inventory answer may reject quickly rather than risk overselling. An operations dashboard may serve a stale-but-labeled answer while the projection catches up. An analytics event can often be buffered or dropped after durability rules are satisfied.</p>
+      </section>
+
+      <section>
+        <h2>Scaling Is a Control, Not a Diagnosis</h2>
+        <p>Kubernetes can add pods, but autoscaling only helps when the pod layer is the limiting resource or when more pods do not overload the next dependency. The <a href="https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/">Horizontal Pod Autoscaling</a> docs describe a controller that adjusts workload scale based on observed metrics. That is useful, but the chosen metric matters.</p>
+        <div class="map">
+          <p><strong>Scaling question sequence:</strong></p>
+          <pre><code>what metric proves pod capacity is the limit?
+what dependency receives more load per added pod?
+what limit prevents new pods from overwhelming that dependency?
+what signal tells autoscaling to stop or slow down?
+what does the system do while new capacity starts?</code></pre>
+        </div>
+        <p>For an API, scaling pods may be correct when CPU is saturated and database/cache pressure is low. It may be wrong when pool waits, database waits, or Redis hot key latency are already the limit. For Kafka consumers, adding consumers helps only until all partitions in the consumer group are assigned; after that, reducing per-event work, changing partitioning, batching, or fixing a slow sink may matter more.</p>
+      </section>
+
+      <section>
+        <h2>Defend the Resume Bullet</h2>
+        <p>Suppose someone asks: "How did you sustain 10K+ req/sec at sub-200 ms P95 during peak traffic?" A strong answer is not "we used Redis and Kubernetes." It explains the capacity argument.</p>
+        <div class="principle">
+          <p><strong>Strong answer shape:</strong></p>
+          <ol>
+            <li>Traffic was bursty and SKU popularity was highly skewed, so hot-path reads had to avoid repeated source-database work.</li>
+            <li>We measured API latency, Redis hit rate, hot key behavior, database pool waits, database query latency, and upstream dependency latency.</li>
+            <li>Redis served the common availability shape with TTLs and freshness boundaries, while misses were controlled so they did not stampede PostgreSQL.</li>
+            <li>API concurrency, connection pools, timeouts, and retries were tuned together, so adding pods did not simply add unbounded database pressure.</li>
+            <li>Lower-value or stale-tolerant reads could degrade before critical checkout behavior was put at risk.</li>
+            <li>The result was defended with before/after P95 latency, throughput, hit rate, pool wait time, error rate, and freshness signals.</li>
+          </ol>
+        </div>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. What comes before scaling pods?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">raise every worker count</button>
+            <button data-correct="true" data-why="Correct. Scaling is useful only after you know which resource is limiting the path.">find the saturated resource</button>
+            <button data-correct="false" data-why="">disable every timeout setting</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. Which signal points to database pressure?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Pool wait means callers are queued for database access before work even starts.">database pool wait rises</button>
+            <button data-correct="false" data-why="">button color changes slowly</button>
+            <button data-correct="false" data-why="">image cache names change</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. What does backpressure do?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Backpressure protects a downstream limit by slowing, rejecting, or reshaping upstream work.">slow producers at boundary</button>
+            <button data-correct="false" data-why="">retry faster on errors</button>
+            <button data-correct="false" data-why="">ignore all queue depth</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. What is the safest scaling habit?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">scale every component equally</button>
+            <button data-correct="false" data-why="">scale before measuring anything</button>
+            <button data-correct="true" data-why="Correct. Add capacity where evidence shows a bottleneck, then verify the next boundary.">scale after proving bottleneck</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required. These are the checks that show whether you can reason about capacity as production judgment:</p>
+        <ol>
+          <li>Why can adding API pods make a database bottleneck worse?</li>
+          <li>What signals distinguish an API bottleneck from a database bottleneck?</li>
+          <li>Why does a lower Redis hit rate create more than a cache problem?</li>
+          <li>When should an API serve stale data, reject quickly, or wait for fresh source truth?</li>
+          <li>Why do retries need deadlines, backoff, jitter, and budgets?</li>
+          <li>What before/after metrics would you use to defend a 10K req/sec performance claim?</li>
+        </ol>
+        <div class="callout">
+          <p><strong>Concise answer key:</strong> more pods can multiply downstream queries; API bottlenecks show CPU/thread/request-queue pressure while database bottlenecks show pool waits, locks, slow queries, I/O, and wait events; cache misses can stampede the source; stale/reject/wait depends on the product correctness contract; retries without limits amplify overload; defend the claim with P95/P99 latency, throughput, error rate, hit rate, pool waits, dependency latency, freshness, and headroom.</p>
+        </div>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. Useful capacity questions here are: "What is the user promise?", "Where does work queue?", "What is saturated?", "Who can slow down?", and "What metric proves the fix worked?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://sre.google/sre-book/handling-overload/">Google SRE Book: Handling Overload</a></li>
+          <li><a href="https://grpc.io/docs/guides/deadlines/">gRPC Documentation: Deadlines</a></li>
+          <li><a href="https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/">Kubernetes Documentation: Horizontal Pod Autoscaling</a></li>
+          <li><a href="https://www.postgresql.org/docs/current/monitoring-stats.html">PostgreSQL Documentation: Monitoring Statistics</a></li>
+          <li><a href="https://redis.io/docs/latest/develop/reference/eviction/">Redis Documentation: Key Eviction</a></li>
+          <li><a href="https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html">Apache KafkaConsumer API Documentation</a></li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>

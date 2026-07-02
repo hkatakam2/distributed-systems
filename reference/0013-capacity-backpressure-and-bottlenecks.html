@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: Capacity, Backpressure, and Bottlenecks</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0013</div>
+        <h1>Capacity, Backpressure, and Bottlenecks</h1>
+        <p class="lede">A compact checklist for reasoning about throughput, latency, queues, saturation, autoscaling, and overload across an end-to-end backend path.</p>
+      </header>
+
+      <section>
+        <h2>The Recurring Shape</h2>
+        <div class="flow">
+          <div><strong>Demand</strong>Name arrival rate, burst shape, tenants, and priority.</div>
+          <div><strong>Work</strong>Estimate service time, fanout, queueing, and retry cost.</div>
+          <div><strong>Limit</strong>Find the saturated pool, store, partition, or dependency.</div>
+          <div><strong>Control</strong>Apply backpressure, shedding, batching, caching, or scaling.</div>
+          <div><strong>Verify</strong>Watch user latency, errors, freshness, saturation, and cost.</div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Vocabulary</h2>
+        <p><strong>Throughput:</strong> completed useful work per unit time, such as requests per second or events per second.</p>
+        <p><strong>Arrival rate:</strong> work entering the system per unit time, before queueing, rejection, or retries.</p>
+        <p><strong>Service time:</strong> time a worker or dependency spends actively processing one unit of work.</p>
+        <p><strong>Concurrency:</strong> work in progress at the same time, including active work and queued work if measured at the boundary.</p>
+        <p><strong>Utilization:</strong> how busy a resource is relative to its practical capacity.</p>
+        <p><strong>Saturation:</strong> a resource has more demand than it can serve promptly, so queues, waits, errors, or latency rise.</p>
+        <p><strong>Queue depth:</strong> work waiting to be processed.</p>
+        <p><strong>Backpressure:</strong> a deliberate signal that slows or rejects upstream work before a downstream limit collapses.</p>
+        <p><strong>Load shedding:</strong> rejecting or dropping lower-value work to preserve the core user promise.</p>
+        <p><strong>Bottleneck:</strong> the limiting resource that determines end-to-end throughput under current load.</p>
+        <p><strong>Fanout:</strong> one request causing multiple downstream calls, queries, messages, or writes.</p>
+        <p><strong>Headroom:</strong> spare practical capacity before user-visible latency, errors, or freshness violate the SLO.</p>
+        <p><strong>Retry amplification:</strong> extra work created when clients retry during slowness, often worsening overload.</p>
+        <p><strong>Freshness:</strong> age of derived state relative to the source facts that produced it.</p>
+      </section>
+
+      <section>
+        <h2>Diagnosis Checklist</h2>
+        <ol>
+          <li>Name the user-visible symptom: latency, errors, stale data, dropped work, or cost spike.</li>
+          <li>Draw the critical path: gateway, service pods, connection pools, caches, databases, logs, workers, and sinks.</li>
+          <li>Measure demand at the entry point and at each fanout boundary.</li>
+          <li>Compare arrival rate with completed throughput at each stage.</li>
+          <li>Look for queue growth, pool waits, partition lag, lock waits, CPU saturation, memory pressure, I/O waits, and external dependency latency.</li>
+          <li>Check whether retries are increasing demand during the incident.</li>
+          <li>Identify the first saturated resource, not the loudest symptom.</li>
+          <li>Apply the smallest control that protects the user promise.</li>
+          <li>Verify the control with latency, errors, freshness, saturation, and cost.</li>
+          <li>Document the new operating limit and the next bottleneck.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Control Table</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Pressure</th>
+              <th>Useful controls</th>
+              <th>Main caution</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>API pods are CPU-bound.</td>
+              <td>Optimize hot path, cache, reduce fanout, scale pods, shed low-value work.</td>
+              <td>More pods may shift pressure to the database or cache.</td>
+            </tr>
+            <tr>
+              <td>Database pool waits rise.</td>
+              <td>Reduce query count, add indexes carefully, cap concurrency, split read paths.</td>
+              <td>Larger pools can overload the database faster.</td>
+            </tr>
+            <tr>
+              <td>Kafka consumer lag grows.</td>
+              <td>Scale consumers up to partition limits, reduce per-event cost, batch, pause unsafe work.</td>
+              <td>More consumers do not help beyond available partitions in a group.</td>
+            </tr>
+            <tr>
+              <td>Redis memory or hot keys saturate.</td>
+              <td>Set TTLs, shard hot keys, cache only useful shapes, add request coalescing.</td>
+              <td>Eviction and stampedes can convert cache pressure into database pressure.</td>
+            </tr>
+            <tr>
+              <td>Retries amplify load.</td>
+              <td>Use deadlines, backoff, jitter, budgets, idempotency, and circuit breakers.</td>
+              <td>Retries without limits can turn partial failure into overload.</td>
+            </tr>
+            <tr>
+              <td>Derived state becomes stale.</td>
+              <td>Expose freshness, throttle producers, prioritize critical events, rebuild from source.</td>
+              <td>Serving stale data is acceptable only when the product contract says so.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Fast Estimation</h2>
+        <div class="map">
+          <pre><code>work in progress ~= arrival rate x end-to-end latency
+
+database queries/sec ~= API requests/sec x queries per request
+
+consumer catch-up time ~= backlog events / sustainable events per second
+
+required headroom ~= peak burst demand / safe sustained capacity</code></pre>
+        </div>
+        <p>Use estimates to find the suspicious boundary, then confirm with telemetry. Estimation chooses where to look; measurement decides what to change.</p>
+      </section>
+
+      <section>
+        <h2>Answer Shape</h2>
+        <div class="principle">
+          <p><strong>When defending capacity work:</strong></p>
+          <ol>
+            <li>Start with the user promise and the exact symptom under load.</li>
+            <li>Name the path and the demand shape, including bursts and fanout.</li>
+            <li>Identify the bottleneck with evidence: queue, pool wait, lag, CPU, lock, or memory signal.</li>
+            <li>Explain the control you chose and why other controls were weaker.</li>
+            <li>Explain how you avoided pushing the problem into the next dependency.</li>
+            <li>State the before and after metrics: P95/P99 latency, throughput, error rate, freshness, and headroom.</li>
+            <li>State the new limit and the runbook signal that tells operators when the limit is close again.</li>
+          </ol>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
