@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0015: Incident Response, Triage, and Postmortems</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0015</div>
+        <h1>Incident Response, Triage, and Postmortems</h1>
+        <p class="lede">The fifteenth mental model: during an incident, the goal is not to prove you are clever. It is to protect the user promise, coordinate change, preserve evidence, and make the system harder to break next time.</p>
+        <p class="compact">Mission link: this turns everything so far into senior backend judgment under pressure: APIs, storage, Kafka/Flink, caches, deployments, observability, SLOs, and recovery all meet in the incident room.</p>
+      </header>
+
+      <section>
+        <h2>Where This Fits</h2>
+        <p><a href="0014-slos-error-budgets-and-operational-promises.html">Lesson 0014</a> taught how to define the user-visible promise and alert when error budget burns. This lesson starts when the page fires: what do you do first, who decides, how do you avoid conflicting fixes, and how does the incident become durable learning?</p>
+        <p>Keep <a href="../reference/0015-incident-response-triage-and-postmortems.html">Reference 0015: Incident Response, Triage, and Postmortems</a> nearby. It is the compressed runbook for this lesson.</p>
+      </section>
+
+      <section>
+        <h2>Concise Answers From Lesson 0014</h2>
+        <ol>
+          <li><strong>Start from users:</strong> SLOs should measure completed promises, not component greenness.</li>
+          <li><strong>Define the ratio:</strong> an SLI is good eligible events divided by total eligible events.</li>
+          <li><strong>Separate spec and source:</strong> the behavior you want to measure is not the same as the telemetry source you use.</li>
+          <li><strong>Budget is a decision tool:</strong> remaining error budget changes rollout, paging, mitigation, and reliability investment.</li>
+          <li><strong>Lag is not always the promise:</strong> users usually care about visible freshness, not only broker offset distance.</li>
+          <li><strong>Burn rate sets urgency:</strong> fast burn pages; slow burn often creates planned reliability work.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>The Big Idea</h2>
+        <p>An incident is a coordination problem wrapped around a technical problem. The technical problem may be a bad deploy, hot database row, Kafka partition skew, Redis stampede, broken rollout, or retry storm. The coordination problem is making sure only the right people change production state, stakeholders know the truth, the team keeps a live record, and mitigation happens before curiosity consumes the error budget.</p>
+        <p>The <a href="https://sre.google/sre-book/managing-incidents/">Google SRE chapter on Managing Incidents</a> frames incident management as preparation, role clarity, communication, a live state document, and handoff. Its guidance is practical: declare early when customer visibility, multi-team coordination, or prolonged uncertainty appears; then prioritize stopping the bleeding, restoring service, and preserving evidence. The <a href="https://sre.google/sre-book/emergency-response/">Emergency Response chapter</a> adds the deeper point: teams do not naturally respond well under stress without preparation and practice.</p>
+        <div class="map">
+          <p><strong>Incident reasoning path:</strong></p>
+          <pre><code>detect promise risk
+  -> declare and assign roles
+  -> stabilize user impact
+  -> preserve evidence and narrow hypotheses
+  -> communicate current truth and next update
+  -> recover, clean up, and write the postmortem
+  -> verify follow-up actions changed the system</code></pre>
+        </div>
+        <p>The trap is treating root cause as the first milestone. In a burning incident, mitigation comes first when user impact is active. You can diagnose deeply after you stop making the user pay for the investigation.</p>
+      </section>
+
+      <section>
+        <h2>Scenario: Freshness Burn After a Release</h2>
+        <p>Suppose a subscription analytics platform has a dashboard freshness SLO: 99.5% of merchant dashboard views should use revenue projection data no older than five minutes over a rolling 30-day window. A new release changes a Flink sink that writes projection rows to PostgreSQL and refreshes Redis keys. Twenty minutes after rollout, the freshness SLO starts burning at 15x.</p>
+        <div class="flow">
+          <div><strong>API</strong>Dashboard reads return 200s but stale projection ages.</div>
+          <div><strong>Redis</strong>Hot dashboard keys are not being refreshed quickly enough.</div>
+          <div><strong>Postgres</strong>Projection upserts show rising lock waits and slow commits.</div>
+          <div><strong>Flink</strong>Checkpoint duration and sink latency climb.</div>
+          <div><strong>Kafka</strong>Consumer lag grows on several high-volume merchant partitions.</div>
+        </div>
+        <p>A narrow response says "debug Flink." A production response says "declare the incident, stop freshness budget burn, coordinate production changes, then debug the path from release to user-visible stale views."</p>
+      </section>
+
+      <section>
+        <h2>Step 1: Declare Before the Room Gets Crowded</h2>
+        <p>The incident threshold should be lower than "total outage." Declare when the work needs coordination, when user impact is visible, when a second team is needed, or when focused investigation has not converged. Declaring is not an admission of disaster; it is how you buy structure early.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Signal</th>
+              <th>Why it deserves incident structure</th>
+              <th>First action</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Freshness burn is 15x.</td>
+              <td>The dashboard promise will be exhausted quickly if the trend continues.</td>
+              <td>Declare severity based on user impact and budget burn.</td>
+            </tr>
+            <tr>
+              <td>Flink, PostgreSQL, Redis, and deploy history are all plausible.</td>
+              <td>Several owners may need to inspect state or change controls.</td>
+              <td>Assign roles so only approved changes happen.</td>
+            </tr>
+            <tr>
+              <td>Merchants see old revenue numbers.</td>
+              <td>A 200 response is not good if the product promise is stale.</td>
+              <td>Communicate impact honestly and set update cadence.</td>
+            </tr>
+            <tr>
+              <td>A rollback may lose temporary sink fixes.</td>
+              <td>The system may diverge from normal state during recovery.</td>
+              <td>Track every mitigation and cleanup task.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Step 2: Split Roles to Reduce Cognitive Load</h2>
+        <p>Google's incident model separates incident command, operational work, communications, and planning. The point is not ceremony. The point is that the person debugging a failing stream sink should not also hold stakeholder status, remember every temporary config, approve every production change, and plan handoff.</p>
+        <div class="principle">
+          <p><strong>Incident commander:</strong> owns high-level state, current priority, role assignment, and the next decision.</p>
+          <p><strong>Ops lead:</strong> makes or coordinates approved production changes: rollback, pause, traffic routing, config, throttling.</p>
+          <p><strong>Communications lead:</strong> writes periodic updates: impact, current status, mitigation, next update time, known unknowns.</p>
+          <p><strong>Planning lead:</strong> tracks follow-ups, cleanup, handoff, temporary state, and postmortem inputs.</p>
+        </div>
+        <p>The key safety property is no freelancing. If three engineers independently "just look" and one silently restarts workers while another changes Redis TTLs and another rolls back the sink, the system becomes harder to reason about than the original failure.</p>
+      </section>
+
+      <section>
+        <h2>Step 3: Stabilize Before Deep Diagnosis</h2>
+        <p>Mitigation reduces impact before the full causal story is known. In this scenario, a reasonable incident commander asks the ops lead for reversible options that protect the freshness promise while evidence is still available.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Option</th>
+              <th>When it fits</th>
+              <th>Risk to watch</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Pause or roll back the release.</td>
+              <td>Freshness burn correlates strongly with the new sink version.</td>
+              <td>Rollback may not clear already accumulated lag or locks.</td>
+            </tr>
+            <tr>
+              <td>Serve stale-labeled dashboard data.</td>
+              <td>Users can tolerate old values if the UI is honest about age.</td>
+              <td>Stale data must not drive irreversible business actions.</td>
+            </tr>
+            <tr>
+              <td>Throttle low-priority recomputations.</td>
+              <td>High-value merchant views need capacity before offline refresh jobs.</td>
+              <td>Delayed work must be tracked so it is not forgotten.</td>
+            </tr>
+            <tr>
+              <td>Split hot merchants to a safer path.</td>
+              <td>A small set of tenants dominates lag or lock waits.</td>
+              <td>Special routing creates cleanup and consistency obligations.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>The strongest mitigation is reversible, measurable, and tied to the SLO. "We rolled back version 2026.06.30.4 and freshness burn fell from 15x to 2x" is stronger than "we changed some settings and things looked better."</p>
+      </section>
+
+      <section>
+        <h2>Step 4: Diagnose From Evidence, Not Drama</h2>
+        <p>The <a href="https://sre.google/sre-book/effective-troubleshooting/">Google SRE chapter on Effective Troubleshooting</a> is useful here because it treats debugging as hypothesis management. Start from the user symptom, narrow the path, compare against recent changes, and test the cheapest discriminating hypothesis.</p>
+        <div class="map">
+          <p><strong>Evidence chain for this incident:</strong></p>
+          <pre><code>fresh dashboard views dropped
+  -> Redis key age increased
+  -> projection upsert latency increased
+  -> PostgreSQL lock waits concentrated on merchant_id
+  -> Flink sink retries increased after release
+  -> new sink changed batch shape and transaction duration</code></pre>
+        </div>
+        <p>This chain may be wrong. That is why the live incident document should show hypotheses with evidence for and against them. If rollback does not reduce burn, the team should say so and move to the next hypothesis rather than defend the first theory.</p>
+      </section>
+
+      <section>
+        <h2>Step 5: Communicate Current Truth</h2>
+        <p>Good incident communication is not an essay. It is a repeated, timestamped snapshot: impact, current status, mitigation, next action, next update time, and known unknowns. This protects the responders from repeated status interruptions and protects stakeholders from guessing.</p>
+        <div class="map">
+          <pre><code>14:10 ET - Dashboard freshness SLO is burning at 15x.
+Impact: some merchants see revenue projections older than five minutes.
+Mitigation: rollout paused; ops is preparing rollback of sink version 2026.06.30.4.
+Current evidence: staleness follows Flink sink latency and PostgreSQL lock waits.
+Next update: 14:25 ET, or earlier if rollback changes burn rate.</code></pre>
+        </div>
+        <p>Notice what this update does not do: it does not promise a root cause before one exists, hide uncertainty, or flood non-responders with low-level logs.</p>
+      </section>
+
+      <section>
+        <h2>Step 6: Postmortem the System, Not the Person</h2>
+        <p>The <a href="https://sre.google/sre-book/postmortem-culture/">Google SRE chapter on Postmortem Culture</a> defines a postmortem as a written record of impact, actions, root causes, and follow-up actions. Its strongest norm is blamelessness: assume people acted reasonably with the information and tools they had, then improve the system around those decisions.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Weak postmortem</th>
+              <th>Stronger postmortem</th>
+              <th>Why it matters</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>"Engineer shipped bad sink code."</td>
+              <td>"Canary did not include high-cardinality merchant partitions, so sink lock amplification was not detected."</td>
+              <td>The second version creates a testable rollout improvement.</td>
+            </tr>
+            <tr>
+              <td>"Flink was slow."</td>
+              <td>"Sink retry loop extended transaction duration, increasing Postgres lock waits and projection age."</td>
+              <td>The second version names the mechanism.</td>
+            </tr>
+            <tr>
+              <td>"We need better monitoring."</td>
+              <td>"Add freshness burn alert by top merchant cohort and include sink retry count in the dashboard."</td>
+              <td>The second version is owned, measurable, and reviewable.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>A useful postmortem produces action items that change future behavior: rollout gates, safer batch sizes, lock wait alerts, runbook updates, replay drills, load tests, ownership, or cleanup automation. A postmortem that only records blame has not strengthened the system.</p>
+      </section>
+
+      <section>
+        <h2>Defend the Resume Bullet</h2>
+        <p>Suppose someone asks: "Tell me about a production incident in your event-driven analytics platform." A strong answer avoids both heroics and vagueness. It shows calm control of the system.</p>
+        <div class="principle">
+          <p><strong>Strong answer shape:</strong></p>
+          <ol>
+            <li>We detected a dashboard freshness SLO fast burn after a stream-sink release.</li>
+            <li>I helped declare the incident early because impact crossed the user promise and required Flink, Postgres, Redis, and release owners.</li>
+            <li>We assigned incident command, ops, communications, and planning so production changes were coordinated.</li>
+            <li>We paused rollout, rolled back the sink, and served stale-labeled views while lag drained, which reduced budget burn.</li>
+            <li>We used traces, sink metrics, database lock waits, Redis key age, and deploy history to isolate the mechanism.</li>
+            <li>The postmortem changed rollout gates, high-cardinality canary coverage, sink batch limits, and freshness alerts.</li>
+          </ol>
+        </div>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. What should happen before deep root-cause work?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Active user impact makes stabilization the first milestone.">stabilize user impact</button>
+            <button data-correct="false" data-why="">debate perfect ownership</button>
+            <button data-correct="false" data-why="">rewrite every service</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. Why declare incidents early?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">increase status confusion</button>
+            <button data-correct="true" data-why="Correct. Early declaration gives the team roles, cadence, and decision flow before work fragments.">create coordination structure</button>
+            <button data-correct="false" data-why="">hide customer impact</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. Who owns high-level incident state?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">random debugging observer</button>
+            <button data-correct="false" data-why="">unrelated product manager</button>
+            <button data-correct="true" data-why="Correct. Incident command owns high-level state, priorities, roles, and decision flow.">incident command role</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. What belongs in stakeholder updates?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. A useful update gives current truth, action, and next update time.">impact action cadence</button>
+            <button data-correct="false" data-why="">raw logs only</button>
+            <button data-correct="false" data-why="">private debug chatter</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>5. What makes postmortems useful?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">assigning personal fault</button>
+            <button data-correct="true" data-why="Correct. Useful postmortems change systems, controls, runbooks, tests, or ownership.">changing system behavior</button>
+            <button data-correct="false" data-why="">hiding unresolved causes</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required. These are the checks that show whether you can reason under production pressure:</p>
+        <ol>
+          <li>Why is an incident a coordination problem as much as a technical problem?</li>
+          <li>When would you declare an incident before knowing the root cause?</li>
+          <li>Why does mitigation often come before diagnosis?</li>
+          <li>What should be in a live incident state document?</li>
+          <li>How can a rollback be both a mitigation and an incomplete fix?</li>
+          <li>What makes a postmortem action item stronger than "add better monitoring"?</li>
+        </ol>
+        <div class="callout">
+          <p><strong>Concise answer key:</strong> incidents require coordinated decisions, changes, communication, and handoffs; declare when user impact, fast burn, multi-team work, or prolonged uncertainty appears; mitigation protects users while diagnosis continues; the state document should track impact, roles, timeline, hypotheses, actions, owners, and next update; rollback can stop new harm while leaving lag, bad data, or cleanup behind; strong action items name a concrete system change, owner, priority, and verification signal.</p>
+        </div>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. Useful incident questions here are: "What user promise is burning?", "Who owns the next decision?", "What mitigation is reversible?", "What evidence would falsify this hypothesis?", and "How will the follow-up be verified?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://sre.google/sre-book/managing-incidents/">Google SRE Book: Managing Incidents</a></li>
+          <li><a href="https://sre.google/sre-book/emergency-response/">Google SRE Book: Emergency Response</a></li>
+          <li><a href="https://sre.google/sre-book/effective-troubleshooting/">Google SRE Book: Effective Troubleshooting</a></li>
+          <li><a href="https://sre.google/sre-book/postmortem-culture/">Google SRE Book: Postmortem Culture</a></li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>

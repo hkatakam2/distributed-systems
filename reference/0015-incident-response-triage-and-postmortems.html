@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: Incident Response, Triage, and Postmortems</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0015</div>
+        <h1>Incident Response, Triage, and Postmortems</h1>
+        <p class="lede">A compact runbook for declaring an incident, stabilizing the user promise, coordinating work, debugging from evidence, and turning the event into durable system improvement.</p>
+      </header>
+
+      <section>
+        <h2>The Recurring Shape</h2>
+        <div class="flow">
+          <div><strong>Declare</strong>Name the incident early when impact, uncertainty, or coordination cost crosses the threshold.</div>
+          <div><strong>Stabilize</strong>Stop budget burn with rollback, traffic shift, throttling, degradation, or feature disablement.</div>
+          <div><strong>Coordinate</strong>Assign command, operations, communications, and planning so changes are not freelanced.</div>
+          <div><strong>Diagnose</strong>Use evidence to narrow the path from symptom to cause without delaying mitigation.</div>
+          <div><strong>Learn</strong>Write the postmortem, assign preventive actions, and verify the system got harder to break.</div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Vocabulary</h2>
+        <p><strong>Incident:</strong> an event that threatens or violates a user promise and requires coordinated response.</p>
+        <p><strong>Incident commander:</strong> the person who owns high-level state, priorities, role assignment, and decision flow during the incident.</p>
+        <p><strong>Ops lead:</strong> the person or team making approved production changes.</p>
+        <p><strong>Communications lead:</strong> the person responsible for periodic stakeholder updates and current incident status.</p>
+        <p><strong>Planning lead:</strong> the person tracking follow-up work, handoff needs, cleanup tasks, and system divergence.</p>
+        <p><strong>Mitigation:</strong> an action that reduces user impact before the full root cause is known.</p>
+        <p><strong>Remediation:</strong> an action that removes or reduces the underlying cause after diagnosis.</p>
+        <p><strong>MTTD:</strong> mean time to detect; how long it takes to know a bad event is happening.</p>
+        <p><strong>MTTA:</strong> mean time to acknowledge; how long it takes for an owner to accept responsibility.</p>
+        <p><strong>MTTR:</strong> mean time to recover; how long it takes to restore the promised service behavior.</p>
+        <p><strong>State document:</strong> the live record of impact, hypotheses, decisions, actions, owners, timestamps, and next update time.</p>
+        <p><strong>Postmortem:</strong> a written record of impact, timeline, contributing causes, mitigation, and follow-up actions.</p>
+      </section>
+
+      <section>
+        <h2>Declare Early When</h2>
+        <ol>
+          <li>The issue is user-visible or threatens an SLO fast burn.</li>
+          <li>A second team is needed to understand or fix the problem.</li>
+          <li>One focused responder has spent too long without narrowing cause.</li>
+          <li>Multiple engineers need to change, inspect, or coordinate production state.</li>
+          <li>The system has diverged from normal operation and will need cleanup.</li>
+          <li>Stakeholders need status, impact, risk, or ETA separated from debug chatter.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Role Table</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Role</th>
+              <th>Owns</th>
+              <th>Avoids</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Incident command</td>
+              <td>Impact, priority, roles, decision log, escalation, and handoff.</td>
+              <td>Getting buried in one terminal and losing the incident-wide picture.</td>
+            </tr>
+            <tr>
+              <td>Operations</td>
+              <td>Approved production changes, rollback, traffic movement, config, and repair commands.</td>
+              <td>Uncoordinated fixes from multiple engineers changing the same system.</td>
+            </tr>
+            <tr>
+              <td>Communications</td>
+              <td>Stakeholder updates, status page input, customer-facing summaries, next-update cadence.</td>
+              <td>Making the primary debugger answer repeated status questions.</td>
+            </tr>
+            <tr>
+              <td>Planning</td>
+              <td>Follow-ups, cleanup, staffing, handoffs, action items, and divergence from normal state.</td>
+              <td>Losing temporary changes and leaving reliability debt unowned.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Mitigation Table</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Symptom</th>
+              <th>Likely first mitigation</th>
+              <th>Evidence to preserve</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Bad deploy burns request SLO.</td>
+              <td>Rollback, pause rollout, disable flag, or route traffic away.</td>
+              <td>Release version, canary metrics, traces, error samples, config diff.</td>
+            </tr>
+            <tr>
+              <td>Database saturation raises API latency.</td>
+              <td>Throttle callers, shed low-value reads, reduce concurrency, kill unsafe query.</td>
+              <td>Wait events, query IDs, pool waits, locks, connection counts.</td>
+            </tr>
+            <tr>
+              <td>Kafka/Flink freshness falls behind.</td>
+              <td>Pause unsafe inputs, scale within partition limits, bypass slow sink, label stale data.</td>
+              <td>Lag age, partition skew, checkpoint duration, backpressure, sink errors.</td>
+            </tr>
+            <tr>
+              <td>Cache miss storm overloads source.</td>
+              <td>Serve bounded stale data, coalesce misses, warm hot keys, shed optional reads.</td>
+              <td>Hit rate, hot keys, TTL changes, database fallback rate, eviction metrics.</td>
+            </tr>
+            <tr>
+              <td>Dependency failure cascades.</td>
+              <td>Open circuit, reduce retries, apply deadlines, degrade response, isolate tenant.</td>
+              <td>Dependency latency, retry volume, timeout rate, request fanout, client versions.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Incident State Template</h2>
+        <div class="map">
+          <pre><code>incident:
+  commander:
+  ops:
+  communications:
+  planning:
+  started_at:
+  next_update_at:
+
+impact:
+  user_journey:
+  sli_or_slo:
+  bad_events:
+  affected_tenants:
+  current_status:
+
+timeline:
+  - time:
+    observation:
+    action:
+    owner:
+    result:
+
+hypotheses:
+  - statement:
+    evidence_for:
+    evidence_against:
+    next_test:
+
+mitigations:
+  - action:
+    owner:
+    rollback_plan:
+    result:
+
+followups:
+  - action:
+    owner:
+    due_date:
+    verification:</code></pre>
+        </div>
+      </section>
+
+      <section>
+        <h2>Postmortem Checklist</h2>
+        <ol>
+          <li>State customer impact in terms of the user promise, not just internal symptoms.</li>
+          <li>Record a factual timeline with timestamps, observations, actions, and results.</li>
+          <li>Separate triggers from contributing causes.</li>
+          <li>Explain why existing controls did not prevent, detect, or contain the issue sooner.</li>
+          <li>Name what went well so the useful parts of the response are preserved.</li>
+          <li>Create action items that change systems, tests, runbooks, alerts, ownership, or rollout gates.</li>
+          <li>Assign each action item one owner, one priority, and one verification signal.</li>
+          <li>Share the learning with the people who operate adjacent systems.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Answer Shape</h2>
+        <div class="principle">
+          <p><strong>When defending incident work:</strong></p>
+          <ol>
+            <li>Name the SLO or user journey that was at risk.</li>
+            <li>Explain when the incident was declared and why.</li>
+            <li>State the mitigation that stopped the burn.</li>
+            <li>Describe the evidence path used to isolate cause.</li>
+            <li>Show how coordination prevented conflicting production changes.</li>
+            <li>Summarize the postmortem action items and how they were verified.</li>
+          </ol>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
