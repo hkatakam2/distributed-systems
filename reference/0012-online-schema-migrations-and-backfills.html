@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: Online Schema Migrations and Backfills</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0012</div>
+        <h1>Online Schema Migrations and Backfills</h1>
+        <p class="lede">A compact guide for changing PostgreSQL schema and historical data while old code, new code, live writes, replicas, and rollback paths still exist.</p>
+      </header>
+
+      <section>
+        <h2>The Recurring Shape</h2>
+        <div class="flow">
+          <div><strong>Expand</strong>Add compatible schema without forcing new behavior.</div>
+          <div><strong>Write</strong>Deploy writers that populate both old and new expectations.</div>
+          <div><strong>Backfill</strong>Move old rows in bounded, observable, pauseable batches.</div>
+          <div><strong>Validate</strong>Prove completeness, correctness, and production cost.</div>
+          <div><strong>Contract</strong>Remove fallback only after rollback no longer needs it.</div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Vocabulary</h2>
+        <p><strong>Online migration:</strong> a schema or data change performed while the system continues serving traffic.</p>
+        <p><strong>Expand and contract:</strong> add compatible structure first, move traffic gradually, then remove old structure later.</p>
+        <p><strong>Backfill:</strong> a job that updates historical rows to match a new representation or invariant.</p>
+        <p><strong>Dual-write:</strong> writing old and new representations during a compatibility window.</p>
+        <p><strong>Read switch:</strong> moving readers from old representation to new representation, usually behind a flag or cohort.</p>
+        <p><strong>Validation:</strong> proving that existing rows satisfy the intended rule before depending on or enforcing it.</p>
+        <p><strong>Contract:</strong> removing old columns, fallback logic, jobs, flags, or indexes after they are no longer needed.</p>
+        <p><strong>Table rewrite:</strong> a physical rewrite of table data, often much riskier than a metadata-only change on large tables.</p>
+        <p><strong><code>NOT VALID</code> constraint:</strong> a constraint added without the initial full validation scan, while still checking later inserts or updates.</p>
+        <p><strong><code>VALIDATE CONSTRAINT</code>:</strong> the later scan that proves pre-existing rows satisfy a not-valid constraint.</p>
+        <p><strong>Concurrent index build:</strong> an index build that avoids blocking writers but performs more work and has special failure behavior.</p>
+        <p><strong>Invalid index:</strong> an index left after a failed concurrent build; it may be ignored by queries but still require cleanup.</p>
+        <p><strong>Replica lag:</strong> delay between primary writes and replica application, often worsened by heavy backfills.</p>
+        <p><strong>Bloat:</strong> dead or unused table and index space created by churn, increasing storage and I/O pressure.</p>
+      </section>
+
+      <section>
+        <h2>Migration Playbook</h2>
+        <ol>
+          <li>Name the business invariant and the exact consumers that will rely on it.</li>
+          <li>Add compatible schema first, such as nullable columns or optional fields.</li>
+          <li>Deploy writers that fill the new representation while old readers still work.</li>
+          <li>Measure new-write coverage, such as null rate by service version.</li>
+          <li>Backfill historical rows in bounded, idempotent batches with stable ordering.</li>
+          <li>Throttle or pause based on latency, locks, replica lag, dead tuples, and error rate.</li>
+          <li>Validate completeness and business correctness before switching readers.</li>
+          <li>Add constraints and indexes with production lock and I/O behavior in mind.</li>
+          <li>Switch reads gradually and compare old versus new behavior.</li>
+          <li>Remove fallback and old schema only after old versions and rollback paths are gone.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Risk Table</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Move</th>
+              <th>Main risk</th>
+              <th>Safer habit</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Add nullable column.</td>
+              <td>Short lock still conflicts with long transactions.</td>
+              <td>Run during quiet windows and watch lock waiters.</td>
+            </tr>
+            <tr>
+              <td>Add volatile default or change type.</td>
+              <td>Table and index rewrite on large data.</td>
+              <td>Split into expand, backfill, validate, and contract phases.</td>
+            </tr>
+            <tr>
+              <td>Run one huge update.</td>
+              <td>Bloat, WAL, lock contention, and replica lag.</td>
+              <td>Use ordered batches, checkpoints, throttling, and pause controls.</td>
+            </tr>
+            <tr>
+              <td>Add constraint directly.</td>
+              <td>Long validation scan and blocked updates.</td>
+              <td>Use <code>NOT VALID</code> where appropriate, then validate separately.</td>
+            </tr>
+            <tr>
+              <td>Build normal index.</td>
+              <td>Writers block until the build finishes.</td>
+              <td>Use <code>CREATE INDEX CONCURRENTLY</code> when production writes must continue.</td>
+            </tr>
+            <tr>
+              <td>Contract old shape early.</td>
+              <td>Rollback image cannot read new data or schema.</td>
+              <td>Keep fallback until old code and consumers are gone.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Backfill Control Loop</h2>
+        <div class="map">
+          <pre><code>while rows remain:
+  select a bounded batch in stable order
+  update only rows still missing the new value
+  record rows changed and high-water mark
+  emit latency, lock, lag, and error metrics
+  sleep, throttle, or pause if production is stressed
+  repeat the final check without SKIP LOCKED</code></pre>
+        </div>
+        <p>Prefer idempotent predicates such as <code>WHERE source_event_id IS NULL</code>. A restarted batch should either finish missing work or do nothing.</p>
+      </section>
+
+      <section>
+        <h2>SQL Patterns</h2>
+        <p><strong>Compatible expansion:</strong></p>
+        <pre><code>ALTER TABLE ledger_entries
+ADD COLUMN source_event_id text;</code></pre>
+<p><strong>Bounded update:</strong></p>
+        <pre><code>WITH batch AS (
+  SELECT l.id, e.event_id
+  FROM ledger_entries AS l
+  JOIN payment_events AS e
+    ON e.payment_id = l.payment_id
+  WHERE l.source_event_id IS NULL
+  ORDER BY l.id
+  FOR UPDATE OF l SKIP LOCKED
+  LIMIT 1000
+)
+UPDATE ledger_entries AS l
+SET source_event_id = batch.event_id
+FROM batch
+WHERE l.id = batch.id
+RETURNING l.id;</code></pre>
+        <p><strong>Deferred validation:</strong></p>
+        <pre><code>ALTER TABLE ledger_entries
+ADD CONSTRAINT ledger_entries_source_event_id_present
+CHECK (source_event_id IS NOT NULL) NOT VALID;
+
+ALTER TABLE ledger_entries
+VALIDATE CONSTRAINT ledger_entries_source_event_id_present;</code></pre>
+        <p><strong>Lower-blocking index build:</strong></p>
+        <pre><code>CREATE INDEX CONCURRENTLY ledger_entries_source_event_lookup_idx
+ON ledger_entries (merchant_id, source_event_id);</code></pre>
+      </section>
+
+      <section>
+        <h2>Production Checks</h2>
+        <ol>
+          <li>Are old application versions, workers, and rollback images compatible with the expanded schema?</li>
+          <li>Do new writes populate the new representation, and is coverage measured by version?</li>
+          <li>Can the backfill pause, resume, retry, and safely run twice?</li>
+          <li>Are batch size and ordering chosen to reduce locks, deadlocks, bloat, and replica lag?</li>
+          <li>Is there a stop threshold for latency, error rate, lock waits, I/O, and lag?</li>
+          <li>Are constraints validated only after the data is actually clean?</li>
+          <li>Does the index build plan account for <code>CONCURRENTLY</code> caveats and invalid-index cleanup?</li>
+          <li>Are readers switched by cohort with old-versus-new comparison?</li>
+          <li>Is the contract step delayed until rollback no longer needs the old shape?</li>
+          <li>Are dashboards and incident notes updated so operators know which phase is active?</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Answer Shape</h2>
+        <div class="principle">
+          <p><strong>When defending an online migration:</strong></p>
+          <ol>
+            <li>Name the invariant, table, consumers, and traffic risk.</li>
+            <li>Explain how old and new code coexisted during expansion.</li>
+            <li>Explain how historical rows were backfilled with bounded, idempotent batches.</li>
+            <li>State what was monitored: latency, locks, lag, bloat, errors, and correctness.</li>
+            <li>State how validation proved the data was ready.</li>
+            <li>State how constraints, indexes, and read switches were rolled out.</li>
+            <li>State when fallback was removed and what rollback looked like before then.</li>
+          </ol>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

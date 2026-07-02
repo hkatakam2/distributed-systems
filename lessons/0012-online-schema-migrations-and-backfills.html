@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0012: Online Schema Migrations and Backfills</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0012</div>
+        <h1>Online Schema Migrations and Backfills</h1>
+        <p class="lede">The twelfth mental model: changing stored data is not a one-time SQL task. It is a rollout across code, schema, historical rows, indexes, constraints, replicas, and rollback paths.</p>
+        <p class="compact">Mission link: this is the judgment behind production PostgreSQL migrations, live backfills, replay-safe ledgers, idempotency tables, feature rollouts, and defending how a backend system evolves without downtime.</p>
+      </header>
+
+      <section>
+        <h2>Where This Fits</h2>
+        <p><a href="0011-query-plans-indexes-and-production-performance.html">Lesson 0011</a> taught you to diagnose query performance from plans, indexes, and production cost. This lesson asks the next operational question: how do you safely change the table and historical data that those queries depend on?</p>
+        <p>Keep <a href="../reference/0012-online-schema-migrations-and-backfills.html">Reference 0012: Online Schema Migrations and Backfills</a> nearby. It is the compressed rollout checklist for this lesson.</p>
+      </section>
+
+      <section>
+        <h2>Concise Answers From Lesson 0011</h2>
+        <ol>
+          <li><strong>"Add an index" is incomplete:</strong> name the query path, access pattern, before plan, after plan, and write-side cost.</li>
+          <li><strong><code>Index Cond</code> versus <code>Filter</code>:</strong> an index condition narrows index access; a filter checks rows already reached.</li>
+          <li><strong>Sequential scans can be right:</strong> broad reads can be cheaper than many random index-driven heap visits.</li>
+          <li><strong><code>ORDER BY ... LIMIT</code> matters:</strong> the best index can emit the first page directly instead of sorting a large candidate set.</li>
+          <li><strong>Statistics can beat indexes:</strong> stale or insufficient estimates can make the planner choose the wrong path.</li>
+          <li><strong>Live index risk:</strong> watch locks, I/O, replication lag, write latency, plan choice, and index usage.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>The Big Idea</h2>
+        <p>An online migration has three clocks. Old code is still running, new code is arriving gradually, and historical rows still have the old shape. A migration is safe only when every clock can coexist for the whole rollout.</p>
+        <p>PostgreSQL's <a href="https://www.postgresql.org/docs/current/sql-altertable.html">ALTER TABLE</a> documentation is explicit that table-definition changes have lock behavior, validation scans, and rewrite risks. The <a href="https://www.postgresql.org/docs/current/sql-update.html">UPDATE</a> documentation warns that large updates can cause table bloat, replica lag, and lock contention, so batching can be appropriate. The <a href="https://www.postgresql.org/docs/current/sql-createindex.html">CREATE INDEX</a> documentation explains why concurrent index builds trade less write blocking for more total work.</p>
+        <div class="map">
+          <p><strong>Safe stored-data change path:</strong></p>
+          <pre><code>expand schema
+  -> deploy compatible writers
+  -> backfill historical rows in batches
+  -> validate data and performance
+  -> enforce constraints and indexes
+  -> switch reads gradually
+  -> contract old shape after rollback is no longer needed</code></pre>
+        </div>
+        <p>The skill is to avoid making the database change the irreversible center of the deploy. First create compatibility, then move data, then enforce, then remove compatibility.</p>
+      </section>
+
+      <section>
+        <h2>Scenario: Add Source Event IDs to Ledger Rows</h2>
+        <p>Suppose your payment ledger was originally written from API calls and stream events, but old rows do not store the source event ID. During replay and incident debugging, you now need every ledger row to carry <code>source_event_id</code> so operators can trace a row back to the exact event that produced it.</p>
+        <div class="flow">
+          <div><strong>Schema</strong>Add nullable field first.</div>
+          <div><strong>Writers</strong>New code fills it.</div>
+          <div><strong>Backfill</strong>Old rows get values.</div>
+          <div><strong>Validate</strong>Nulls and drift go away.</div>
+          <div><strong>Enforce</strong>Constraints and indexes land.</div>
+        </div>
+        <p>A weak plan is: add <code>NOT NULL</code>, run one giant update, deploy code, and hope. A production plan treats each step as a reversible exposure decision.</p>
+      </section>
+
+      <section>
+        <h2>Step 1: Expand Without Depending on It</h2>
+        <p>Start by adding structure that old code can ignore and new code can populate. For this scenario, that means a nullable column and no immediate reader dependency:</p>
+        <pre><code>ALTER TABLE ledger_entries
+ADD COLUMN source_event_id text;</code></pre>
+        <p>The <a href="https://www.postgresql.org/docs/current/sql-altertable.html">ALTER TABLE</a> docs say that most subforms acquire an <code>ACCESS EXCLUSIVE</code> lock unless noted otherwise, so even a fast metadata change should be reviewed for lock timing. They also distinguish fast column additions from rewrite-heavy ones: a non-volatile default can avoid rewriting existing rows, while volatile defaults, some generated columns, constrained domain types, and many type changes can rewrite the table and its indexes.</p>
+        <div class="principle">
+          <p><strong>Production rule:</strong> adding a column is not automatically dangerous, but depending on it immediately is.</p>
+          <p>Old pods, old jobs, old consumers, and old rollback images must tolerate the expanded schema. This is the same compatibility principle from <a href="0008-deployment-safety-rollouts-schema-and-rollbacks.html">Lesson 0008</a>, now applied to persistent state.</p>
+        </div>
+      </section>
+
+      <section>
+        <h2>Step 2: Make New Writes Compatible</h2>
+        <p>Deploy writers that populate <code>source_event_id</code> for new ledger rows, while readers still tolerate missing values. Instrument the null rate before starting the historical backfill.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Question</th>
+              <th>Strong answer</th>
+              <th>Why it matters</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Can old code still run?</td>
+              <td>Yes, the new column is nullable and ignored by old code.</td>
+              <td>Rollback does not fail because the schema is expanded.</td>
+            </tr>
+            <tr>
+              <td>Can new writes prove progress?</td>
+              <td>Yes, dashboards show null rate by writer version.</td>
+              <td>You know whether the new code is actually filling the field.</td>
+            </tr>
+            <tr>
+              <td>Can reads switch gradually?</td>
+              <td>Yes, the API keeps fallback behavior until validation passes.</td>
+              <td>Readers are not coupled to a backfill finishing perfectly.</td>
+            </tr>
+            <tr>
+              <td>Can replay stay idempotent?</td>
+              <td>Yes, each batch can be rerun without changing completed rows.</td>
+              <td>A failed job does not require starting from scratch.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Step 3: Backfill Like a Production Job</h2>
+        <p>A backfill is a writer. It creates WAL, dirties pages, competes for locks, can increase replica lag, can trigger autovacuum work, and can change query plans after statistics shift. That is why the PostgreSQL <a href="https://www.postgresql.org/docs/current/sql-update.html">UPDATE</a> docs recommend smaller batches for large updates and show a common-table-expression pattern because <code>UPDATE</code> has no direct <code>LIMIT</code> clause.</p>
+        <pre><code>WITH batch AS (
+  SELECT l.id, e.event_id
+  FROM ledger_entries AS l
+  JOIN payment_events AS e
+    ON e.payment_id = l.payment_id
+  WHERE l.source_event_id IS NULL
+  ORDER BY l.id
+  FOR UPDATE OF l SKIP LOCKED
+  LIMIT 1000
+)
+UPDATE ledger_entries AS l
+SET source_event_id = batch.event_id
+FROM batch
+WHERE l.id = batch.id
+RETURNING l.id;</code></pre>
+        <p>This is not the only valid SQL shape. The important properties are bounded work, stable ordering, idempotent predicates, and a way to know how much work was actually done. If you use <code>UPDATE ... FROM</code>, the PostgreSQL docs warn that each target row should join to at most one source row, or the chosen source row is not predictable.</p>
+        <div class="map">
+          <p><strong>Backfill control loop:</strong></p>
+          <pre><code>run one batch
+  -> record rows updated and last key range
+  -> sleep or throttle if latency, locks, or replica lag rise
+  -> repeat until no rows remain
+  -> run final verification without SKIP LOCKED</code></pre>
+        </div>
+      </section>
+
+      <section>
+        <h2>Step 4: Validate Before You Enforce</h2>
+        <p>Validation turns "the job finished" into evidence. Count remaining nulls, sample joined rows against source events, look for ambiguous joins, compare ledger totals before and after, and check whether write latency or replica lag changed.</p>
+        <pre><code>SELECT count(*) AS missing_source_event_id
+FROM ledger_entries
+WHERE source_event_id IS NULL;
+
+SELECT source_event_id, count(*) AS ledger_rows
+FROM ledger_entries
+GROUP BY source_event_id
+HAVING count(*) > 1
+ORDER BY ledger_rows DESC
+LIMIT 20;</code></pre>
+        <p>The second query is not automatically an error because one event might legitimately produce multiple ledger rows. The point is to force the business rule into the open. The invariant must be named before the database can enforce it.</p>
+      </section>
+
+      <section>
+        <h2>Step 5: Enforce in Low-Blast-Radius Pieces</h2>
+        <p>Once new writes populate the field and old rows are backfilled, add the guardrails. PostgreSQL supports <code>NOT VALID</code> for check, foreign-key, and not-null constraints; the docs say this skips the initial scan while still applying the constraint to later inserts and updates, then <code>VALIDATE CONSTRAINT</code> scans existing rows with a lower lock level than a blocking add.</p>
+        <pre><code>ALTER TABLE ledger_entries
+ADD CONSTRAINT ledger_entries_source_event_id_present
+CHECK (source_event_id IS NOT NULL) NOT VALID;
+
+ALTER TABLE ledger_entries
+VALIDATE CONSTRAINT ledger_entries_source_event_id_present;</code></pre>
+        <p>If the lookup path needs an index, build it with production cost in mind:</p>
+        <pre><code>CREATE INDEX CONCURRENTLY ledger_entries_source_event_lookup_idx
+ON ledger_entries (merchant_id, source_event_id);</code></pre>
+        <p>The <a href="https://www.postgresql.org/docs/current/sql-createindex.html">CREATE INDEX</a> docs say <code>CONCURRENTLY</code> avoids locks that block inserts, updates, and deletes, but it performs more work, takes longer, waits for transactions, cannot run inside a transaction block, and can leave an invalid index after failure. That means your migration runner and rollback plan must understand it.</p>
+      </section>
+
+      <section>
+        <h2>Step 6: Switch Reads, Then Contract</h2>
+        <p>After validation, switch readers gradually: internal users, one tenant cohort, one region, then broader traffic. Watch the same rollout signals as earlier lessons: latency, errors, saturation, freshness, correctness, and rollback health.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Phase</th>
+              <th>Safe move</th>
+              <th>Stop condition</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Read switch</td>
+              <td>Use <code>source_event_id</code> for a small cohort first.</td>
+              <td>Trace lookups fail, latency regresses, or null fallback fires.</td>
+            </tr>
+            <tr>
+              <td>Broad release</td>
+              <td>Increase traffic after comparing old and new paths.</td>
+              <td>Ledger drift, replay mismatch, or elevated database pressure.</td>
+            </tr>
+            <tr>
+              <td>Contract</td>
+              <td>Remove fallback code after old versions are gone.</td>
+              <td>Any rollback image still needs the fallback path.</td>
+            </tr>
+            <tr>
+              <td>Cleanup</td>
+              <td>Drop old columns, jobs, flags, or indexes later.</td>
+              <td>Consumers, exports, dashboards, or incident tools still read them.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>Contracting is where many teams break rollback. Do it only after the old code path is no longer a recovery option.</p>
+      </section>
+
+      <section>
+        <h2>Observe the Migration, Not Just the SQL</h2>
+        <p>PostgreSQL's <a href="https://www.postgresql.org/docs/current/progress-reporting.html">progress reporting</a> docs list progress views for operations such as <code>CREATE INDEX</code>, <code>ANALYZE</code>, and <code>VACUUM</code>. Combine those database views with service telemetry so the rollout is judged by user and system impact, not by whether a command returned successfully.</p>
+        <div class="flow">
+          <div><strong>Rows</strong>remaining, updated, skipped.</div>
+          <div><strong>Locks</strong>waiters and blocked writers.</div>
+          <div><strong>Lag</strong>replica and consumer delay.</div>
+          <div><strong>Bloat</strong>dead tuples and vacuum pressure.</div>
+          <div><strong>Users</strong>latency and correctness.</div>
+        </div>
+        <p>A good backfill can pause. A great backfill knows when to pause before users notice.</p>
+      </section>
+
+      <section>
+        <h2>How to Defend the Resume Bullet</h2>
+        <p>Suppose someone asks: "You said you ran an online migration for a high-volume ledger. What made it safe?" A strong answer is operational, not ceremonial.</p>
+        <div class="principle">
+          <p><strong>Strong answer shape:</strong></p>
+          <ol>
+            <li>We first expanded the schema with a nullable field so old and new code could coexist.</li>
+            <li>We deployed writers that populated the new field and measured null rate by version.</li>
+            <li>We backfilled historical rows in ordered, idempotent batches with checkpoints and throttling.</li>
+            <li>We monitored write latency, locks, replica lag, dead tuples, and user-facing latency during the job.</li>
+            <li>We validated data completeness and business correctness before adding constraints or switching reads.</li>
+            <li>We used <code>NOT VALID</code> validation and concurrent index builds where appropriate, with explicit recovery for failed or invalid indexes.</li>
+            <li>We removed fallback behavior only after the old code path was no longer needed for rollback.</li>
+          </ol>
+        </div>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. Which step keeps old code working?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Expand first so old and new code can share the database shape.">expand before code depends</button>
+            <button data-correct="false" data-why="">contract before readers switch</button>
+            <button data-correct="false" data-why="">backfill before schema exists</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. What makes a backfill safer?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">single transaction over everything</button>
+            <button data-correct="true" data-why="Correct. Batches with checkpoints let the job pause, resume, and limit blast radius.">bounded batches with checkpoints</button>
+            <button data-correct="false" data-why="">unbounded writes until completion</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. Why add <code>NOT VALID</code> first?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. It avoids the initial full validation scan while still guarding future writes.">skip initial table scan</button>
+            <button data-correct="false" data-why="">drop all existing rows</button>
+            <button data-correct="false" data-why="">ignore future bad writes</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. What does <code>CREATE INDEX CONCURRENTLY</code> trade?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">less storage more locking</button>
+            <button data-correct="false" data-why="">less proof more speed</button>
+            <button data-correct="true" data-why="Correct. It avoids blocking writers, but does more total work and takes longer.">less blocking more work</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required. These are the checks that show whether you can reason about schema change as production engineering:</p>
+        <ol>
+          <li>Why is "run a migration" not a complete rollout plan?</li>
+          <li>What must be true before a reader can depend on a new column?</li>
+          <li>Why should a large backfill be idempotent and pauseable?</li>
+          <li>What can go wrong when adding a constraint to a large live table?</li>
+          <li>Why can a failed concurrent index build still require cleanup?</li>
+          <li>When is it safe to remove fallback code or old schema?</li>
+        </ol>
+        <div class="callout">
+          <p><strong>Concise answer key:</strong> migrations affect code, schema, data, indexes, replicas, and rollback; readers should wait for compatible writers, backfill, validation, and guarded rollout; pauseable batches limit locks, bloat, replica lag, and recovery cost; constraints may scan and lock; failed concurrent indexes can remain invalid and still add write overhead; contract only after old versions and rollback paths no longer need the old shape.</p>
+        </div>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. Useful migration questions here are: "Can old and new code coexist?", "How do we pause this job?", "What proves the data is correct?", "What blocks writers?", and "What exactly is the rollback path?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://www.postgresql.org/docs/current/sql-altertable.html">PostgreSQL Documentation: ALTER TABLE</a></li>
+          <li><a href="https://www.postgresql.org/docs/current/sql-update.html">PostgreSQL Documentation: UPDATE</a></li>
+          <li><a href="https://www.postgresql.org/docs/current/sql-createindex.html">PostgreSQL Documentation: CREATE INDEX</a></li>
+          <li><a href="https://www.postgresql.org/docs/current/progress-reporting.html">PostgreSQL Documentation: Progress Reporting</a></li>
+          <li><a href="https://www.postgresql.org/docs/current/routine-vacuuming.html">PostgreSQL Documentation: Routine Vacuuming</a></li>
+          <li><a href="https://kubernetes.io/docs/concepts/workloads/controllers/deployment/">Kubernetes Documentation: Deployments</a></li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
