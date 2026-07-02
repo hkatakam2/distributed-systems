@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0014: SLOs, Error Budgets, and Operational Promises</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0014</div>
+        <h1>SLOs, Error Budgets, and Operational Promises</h1>
+        <p class="lede">The fourteenth mental model: production reliability is not "keep every component green." It is choosing the user-visible promises that matter, measuring them honestly, and spending the reliability budget deliberately.</p>
+        <p class="compact">Mission link: this ties together high-throughput APIs, PostgreSQL correctness, Kafka/Flink freshness, Redis serving state, Kubernetes rollouts, observability, and incident defense into one operational contract.</p>
+      </header>
+
+      <section>
+        <h2>Where This Fits</h2>
+        <p><a href="0013-capacity-backpressure-and-bottlenecks.html">Lesson 0013</a> taught how to find saturated boundaries and protect the user promise under load. This lesson asks a prior question: what exactly is the user promise, and how do you know whether the system is meeting it?</p>
+        <p>Keep <a href="../reference/0014-slos-error-budgets-and-operational-promises.html">Reference 0014: SLOs, Error Budgets, and Operational Promises</a> nearby. It is the compressed design checklist for this lesson.</p>
+      </section>
+
+      <section>
+        <h2>Concise Answers From Lesson 0013</h2>
+        <ol>
+          <li><strong>Scale after diagnosis:</strong> adding pods helps only if the pod layer is the limiting resource.</li>
+          <li><strong>Work multiplies:</strong> traffic, fanout, latency, retries, and misses can turn one user action into many downstream operations.</li>
+          <li><strong>Backpressure protects:</strong> bounded queues, deadlines, shedding, and throttles prevent a limit from becoming collapse.</li>
+          <li><strong>Cache misses are capacity events:</strong> lower hit rate can become database pressure and user latency.</li>
+          <li><strong>Kafka lag is a symptom:</strong> the real question is whether user-visible derived state is still within its freshness promise.</li>
+          <li><strong>Metrics defend claims:</strong> throughput claims need latency, errors, saturation, freshness, and headroom.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>The Big Idea</h2>
+        <p>An SLO is the bridge between architecture and operations. It says: for this user journey, this measurable behavior must be good enough over this window. The <a href="https://sre.google/sre-book/service-level-objectives/">Google SRE book chapter on Service Level Objectives</a> frames SLIs as quantitative measures of service behavior, and SLOs as target values for those measures. The <a href="https://sre.google/workbook/implementing-slos/">Google SRE Workbook chapter on implementing SLOs</a> gives the practical recipe: define the user, pick the important journey, specify good events over total events, choose an implementation, and iterate.</p>
+        <p>The useful form is usually a ratio:</p>
+        <div class="map">
+          <pre><code>SLI = good events / total eligible events
+
+SLO = target for that SLI over a window
+
+error budget = total eligible events x (1 - SLO target)</code></pre>
+        </div>
+        <p>If a checkout API has a 99.9% SLO over 10,000,000 eligible attempts in 30 days, the budget is 10,000 bad attempts. That number is not a trophy. It is a decision boundary: how much unreliability the team agreed users can tolerate while the product still moves forward.</p>
+        <p>The first trap is aiming for 100%. The SRE Workbook argues that 100% is usually the wrong reliability target because it makes change, cost, and real-world dependency failures impossible to reason about. The second trap is measuring components instead of users. CPU, pod restarts, cache hit rate, Kafka lag, and database waits are cause signals. They explain why the promise is in danger. They are not usually the promise itself.</p>
+      </section>
+
+      <section>
+        <h2>Scenario: Revenue Platform With Real-Time Views</h2>
+        <p>Suppose the system accepts subscription changes, writes a durable ledger row in PostgreSQL, publishes events through an outbox to Kafka, computes revenue projections in Flink, and serves merchant dashboards through Redis-backed read models.</p>
+        <div class="flow">
+          <div><strong>Client/API</strong>Subscription writes and dashboard reads.</div>
+          <div><strong>Postgres</strong>Ledger facts, constraints, transactions.</div>
+          <div><strong>Outbox/Kafka</strong>Durable event publication and replay.</div>
+          <div><strong>Flink</strong>Stateful revenue projection and checkpoints.</div>
+          <div><strong>Redis/UI</strong>Fast reads with freshness boundaries.</div>
+        </div>
+        <p>A weak reliability posture says "Postgres is up, Kafka is green, and pods are running." A production SLO posture asks: can users make the critical write, can they see a fresh enough view, and can operators prove the system is inside the agreed promise?</p>
+      </section>
+
+      <section>
+        <h2>Step 1: Choose User Journeys, Not Components</h2>
+        <p>SLOs should start from the behavior users or downstream systems need, then map back to components for diagnosis. Different journeys deserve different promises.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>User promise</th>
+              <th>Good event</th>
+              <th>Why not a component SLO?</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Subscription change completes safely.</td>
+              <td>The API commits exactly one intended state change or returns a valid business reject within 300 ms.</td>
+              <td>HTTP 200 rate alone misses duplicate writes, timeout ambiguity, and correctness failures.</td>
+            </tr>
+            <tr>
+              <td>Merchant dashboard is fresh enough.</td>
+              <td>A dashboard view uses projection data no older than five minutes.</td>
+              <td>Kafka lag alone does not say whether a user saw stale revenue data.</td>
+            </tr>
+            <tr>
+              <td>Ledger data remains auditable.</td>
+              <td>An accepted ledger write can later be read intact by audit and reconciliation paths.</td>
+              <td>Database uptime alone does not prove the particular data users need is durable and readable.</td>
+            </tr>
+            <tr>
+              <td>Degraded mode is honest.</td>
+              <td>The response either meets the normal data contract or clearly labels stale/degraded fields.</td>
+              <td>A 200 response can still be bad if it silently omits required information.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Step 2: Separate SLI Specification From Implementation</h2>
+        <p>The SRE Workbook makes a useful distinction: first specify what you mean, then choose how to measure it. The specification is the user-facing behavior. The implementation is the telemetry source.</p>
+        <div class="principle">
+          <p><strong>Specification:</strong> proportion of dashboard views where revenue data is no older than five minutes.</p>
+          <p><strong>Implementation A:</strong> server logs record dashboard response freshness at render time.</p>
+          <p><strong>Implementation B:</strong> client telemetry reports freshness after the browser receives the response.</p>
+          <p><strong>Implementation C:</strong> a periodic probe checks freshness for representative merchants.</p>
+        </div>
+        <p>Each implementation has blind spots. Server logs are cheap but may miss network or browser failures. Client telemetry is closer to user experience but requires instrumentation and its own reliable ingestion path. Probes are controlled and repeatable but may not represent all tenants or skewed traffic. Good SLO design states the blind spot instead of pretending measurement is perfect.</p>
+      </section>
+
+      <section>
+        <h2>Step 3: Translate the Promise Into Budget</h2>
+        <p>Error budget turns a percentage into operational permission. If the system serves 10,000,000 eligible dashboard views in 30 days and the freshness SLO is 99.5%, the service can have 50,000 stale views before missing the objective. If the checkout write SLO is 99.9% over 2,000,000 eligible attempts, the budget is 2,000 bad attempts.</p>
+        <p>This math changes priorities. A deployment causing 1,000 bad checkout attempts spends half of the checkout budget in one incident. The same number of stale dashboard views may be serious or ordinary depending on the dashboard's target, user base, and business promise.</p>
+        <div class="map">
+          <pre><code>budgeted bad rate = 1 - SLO target
+observed bad rate = bad events / total events
+burn rate = observed bad rate / budgeted bad rate</code></pre>
+        </div>
+        <p>If a 99.9% SLO budgets a 0.1% bad rate, then a 1% observed bad rate burns the budget at 10x. That means the service is spending unreliability ten times faster than planned.</p>
+      </section>
+
+      <section>
+        <h2>Step 4: Make Budget a Decision Tool</h2>
+        <p>An SLO without an action policy becomes another dashboard number. The SRE Workbook is explicit that SLOs need stakeholder approval, ownership, and a policy for using the budget in prioritization.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Budget state</th>
+              <th>What the team does</th>
+              <th>Example backend decision</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Healthy</td>
+              <td>Ship with normal rollout controls.</td>
+              <td>Proceed with a canary release and monitor checkout and freshness SLIs.</td>
+            </tr>
+            <tr>
+              <td>Fast burn</td>
+              <td>Page and mitigate.</td>
+              <td>Roll back a bad deploy, shed low-value dashboard reads, or switch to stale-labeled mode.</td>
+            </tr>
+            <tr>
+              <td>Slow burn</td>
+              <td>Ticket and fix trend.</td>
+              <td>Investigate rising Flink checkpoint duration before it becomes a freshness miss.</td>
+            </tr>
+            <tr>
+              <td>Exhausted</td>
+              <td>Pause risky launches and repay reliability debt.</td>
+              <td>Prioritize idempotency fixes, query-plan repair, consumer throughput, or rollback safety over new features.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>This is where SLOs become senior-engineering judgment. The point is not to stop all change. The point is to decide which change is worth the remaining risk.</p>
+      </section>
+
+      <section>
+        <h2>Step 5: Alert on Burn, Diagnose With Components</h2>
+        <p>The <a href="https://sre.google/workbook/alerting-on-slos/">SRE Workbook chapter on alerting on SLOs</a> recommends alerting on meaningful error-budget burn rather than every noisy symptom. Burn-rate alerts answer: if this continues, how quickly will users lose the reliability we promised?</p>
+        <p>For high-traffic services, multiwindow burn-rate alerts are useful because they can page when budget is burning quickly and ticket when budget is burning slowly. The exact thresholds depend on service criticality, traffic volume, and page load, but the shape is stable:</p>
+        <div class="map">
+          <pre><code>fast burn over short + medium windows -> page
+slow burn over long window           -> ticket
+component metrics                    -> diagnosis, not the user promise</code></pre>
+        </div>
+        <p>If the dashboard freshness SLO is burning, component signals help narrow cause: Kafka lag, hot partitions, Flink backpressure, checkpoint duration, sink latency, Redis stale-key age, database query waits, or a recent deployment. The SLO tells you the user promise is at risk. The components tell you where to intervene.</p>
+      </section>
+
+      <section>
+        <h2>Defend the Resume Bullet</h2>
+        <p>Suppose someone asks: "How did you make a real-time revenue platform production-ready?" A strong answer does not stop at "we had dashboards and alerts." It explains the operational contract.</p>
+        <div class="principle">
+          <p><strong>Strong answer shape:</strong></p>
+          <ol>
+            <li>We identified separate promises for write correctness, dashboard freshness, and audit durability.</li>
+            <li>For each promise, we defined eligible events, good events, thresholds, and measurement sources.</li>
+            <li>We treated Kafka lag, Redis hit rate, database waits, and pod health as cause metrics, not the SLO itself.</li>
+            <li>We translated targets into error budgets so incidents and launches had a shared decision rule.</li>
+            <li>We paged on fast budget burn, created tickets for slow burn, and used traces/logs/metrics to localize causes.</li>
+            <li>We revised SLOs when user pain and measured reliability diverged, instead of treating the first version as sacred.</li>
+          </ol>
+        </div>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. What is an SLI?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. An SLI measures service behavior that matters to users or downstream consumers.">measured user-facing service behavior</button>
+            <button data-correct="false" data-why="">internal database tuning value</button>
+            <button data-correct="false" data-why="">planned cloud spending category</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. What is an SLO?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">trace identifier naming rule</button>
+            <button data-correct="true" data-why="Correct. An SLO is the target for an SLI over a defined window.">target over measured behavior</button>
+            <button data-correct="false" data-why="">replica leader election term</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. What is an error budget?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">total infrastructure spend limit</button>
+            <button data-correct="false" data-why="">average CPU utilization goal</button>
+            <button data-correct="true" data-why="Correct. The error budget is the amount of bad service tolerated before action changes.">allowed unreliability before action</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. What fits an async freshness SLI?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Fresh user-visible views over total views measures the promise users experience.">fresh views over total</button>
+            <button data-correct="false" data-why="">worker pods over total</button>
+            <button data-correct="false" data-why="">code branches over total</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>5. Why use burn-rate alerts?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">ignore short severe outages</button>
+            <button data-correct="true" data-why="Correct. Burn rate tells you how quickly the service is spending its reliability budget.">prioritize fast budget loss</button>
+            <button data-correct="false" data-why="">replace all debugging signals</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required. These are the checks that show whether you can reason from architecture to operational promises:</p>
+        <ol>
+          <li>Why should an SLO start from a user journey rather than a component dashboard?</li>
+          <li>How would you define good and total events for a checkout write endpoint?</li>
+          <li>Why is Kafka lag a weak SLO by itself for a merchant dashboard?</li>
+          <li>What is the practical difference between SLI specification and SLI implementation?</li>
+          <li>How does an error budget change release and incident decisions?</li>
+          <li>Why might a slow burn create a ticket while a fast burn creates a page?</li>
+        </ol>
+        <div class="callout">
+          <p><strong>Concise answer key:</strong> users care about completed promises, not whether every component is green; checkout good events include correct commits or valid business rejects under deadline over eligible attempts; Kafka lag is only a cause signal because users care about visible state freshness; specification names the desired behavior while implementation names the telemetry source; error budget creates a shared rule for risk, rollout, and reliability work; fast burn threatens the SLO quickly, while slow burn often needs planned repair rather than immediate interruption.</p>
+        </div>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. Useful SLO questions here are: "Who is the user?", "What event is eligible?", "What counts as good?", "What does the measurement miss?", and "What action changes when budget burns?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://sre.google/sre-book/service-level-objectives/">Google SRE Book: Service Level Objectives</a></li>
+          <li><a href="https://sre.google/workbook/implementing-slos/">Google SRE Workbook: Implementing SLOs</a></li>
+          <li><a href="https://sre.google/workbook/alerting-on-slos/">Google SRE Workbook: Alerting on SLOs</a></li>
+          <li><a href="https://sre.google/sre-book/monitoring-distributed-systems/">Google SRE Book: Monitoring Distributed Systems</a></li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
