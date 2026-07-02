@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0011: Query Plans, Indexes, and Production Performance</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0011</div>
+        <h1>Query Plans, Indexes, and Production Performance</h1>
+        <p class="lede">The eleventh mental model: a slow database query is not fixed by saying "add an index." It is fixed by proving how PostgreSQL reaches rows, why that path is expensive, and what production cost the fix adds.</p>
+        <p class="compact">Mission link: this is the judgment behind high-throughput APIs, dashboards, materialized views, idempotency tables, job queues, multitenant data access, and defending a performance improvement beyond "we optimized SQL."</p>
+      </header>
+
+      <section>
+        <h2>Where This Fits</h2>
+        <p><a href="0010-transaction-isolation-and-concurrency-control.html">Lesson 0010</a> focused on keeping writes correct under concurrency. This lesson focuses on keeping reads and write-side lookups fast enough as data grows.</p>
+        <p>Keep <a href="../reference/0011-query-plans-indexes-and-production-performance.html">Reference 0011: Query Plans, Indexes, and Production Performance</a> nearby. It is the compressed decision sheet for this lesson.</p>
+      </section>
+
+      <section>
+        <h2>Concise Answers From Lesson 0010</h2>
+        <ol>
+          <li><strong>Transaction versus invariant:</strong> a transaction boundary is not a correctness argument; name the rule it protects.</li>
+          <li><strong>Duplicate requests:</strong> a unique database constraint arbitrates races better than application memory.</li>
+          <li><strong>Conditional updates:</strong> keep the predicate with the write so concurrent updates cannot overwrite a stale decision.</li>
+          <li><strong>Repeatable Read limit:</strong> stable snapshots can still miss cross-row conflicts such as write skew.</li>
+          <li><strong>Serializable retry:</strong> retry the whole transaction because the database rejected the observed execution.</li>
+          <li><strong>Contention signals:</strong> watch waits, aborts, retries, deadlocks, conflicts, and transaction duration.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>The Big Idea</h2>
+        <p>PostgreSQL builds a query plan for each query. The plan is a tree of operations: scans at the bottom, then joins, sorts, aggregates, limits, and other nodes above them. The official <a href="https://www.postgresql.org/docs/current/using-explain.html">Using EXPLAIN</a> guide emphasizes that plan choice depends on the query shape and the properties of the data.</p>
+        <p>An index lets the database find specific rows faster, but PostgreSQL's <a href="https://www.postgresql.org/docs/current/indexes.html">index documentation</a> also notes the tradeoff: indexes add overhead. A senior performance answer therefore has two halves: why this access path is faster, and what cost it adds to writes, storage, vacuuming, and rollout.</p>
+        <div class="map">
+          <p><strong>Slow query decision path:</strong></p>
+          <pre><code>symptom
+  -> exact SQL and parameters
+  -> EXPLAIN plan
+  -> estimated rows versus actual rows
+  -> access path and filters
+  -> smallest useful index or query change
+  -> production rollout and proof</code></pre>
+        </div>
+      </section>
+
+      <section>
+        <h2>Scenario: Recent Open Orders</h2>
+        <p>Suppose a merchant dashboard needs the 50 newest open orders. The endpoint is now slow for large merchants.</p>
+        <pre><code>SELECT id, created_at, total_cents, status
+FROM orders
+WHERE merchant_id = $1
+  AND status = 'open'
+ORDER BY created_at DESC
+LIMIT 50;</code></pre>
+        <p>The weak diagnosis is "we need an index on orders." The production diagnosis asks a sharper question: can PostgreSQL quickly jump to this merchant's open rows in the right order, stop after 50, and avoid scanning or sorting a large fraction of the table?</p>
+        <div class="flow">
+          <div><strong>Tenant</strong><code>merchant_id</code> narrows the customer boundary.</div>
+          <div><strong>Subset</strong><code>status = 'open'</code> names the hot working set.</div>
+          <div><strong>Order</strong><code>created_at DESC</code> matches the page order.</div>
+          <div><strong>Limit</strong>Only the first 50 rows matter.</div>
+          <div><strong>Output</strong>Small columns can sometimes be covered.</div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Read the Plan Before Designing the Index</h2>
+        <p><code>EXPLAIN</code> shows the plan PostgreSQL expects to use. <code>EXPLAIN ANALYZE</code> executes the query and shows actual row counts and timing, so use it only where executing the query is safe. The PostgreSQL docs call out that costs are planner units, while actual times are real milliseconds; the more important diagnostic is often whether estimated rows are close to actual rows.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Plan clue</th>
+              <th>What it suggests</th>
+              <th>Question to ask</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>Seq Scan</code> on a large table.</td>
+              <td>The planner expects reading broadly to be cheaper than using an index.</td>
+              <td>Is the predicate selective, or does it really touch many rows?</td>
+            </tr>
+            <tr>
+              <td><code>Filter</code> removes many rows.</td>
+              <td>The condition is checked after rows are reached.</td>
+              <td>Could this predicate become an <code>Index Cond</code>?</td>
+            </tr>
+            <tr>
+              <td>Large <code>Sort</code> before <code>Limit</code>.</td>
+              <td>PostgreSQL may find many rows, sort them, then discard most.</td>
+              <td>Can index order produce the first page directly?</td>
+            </tr>
+            <tr>
+              <td>Bad estimate versus actual rows.</td>
+              <td>The planner may be choosing from wrong assumptions.</td>
+              <td>Are statistics stale, skewed, or missing correlation?</td>
+            </tr>
+            <tr>
+              <td>High <code>loops</code> on an inner node.</td>
+              <td>A small operation may be repeated many times.</td>
+              <td>Is a join order or nested lookup exploding?</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Design the Index From the Query Shape</h2>
+        <p>For the recent-open-orders query, a useful index aligns the stable filter and order:</p>
+        <pre><code>CREATE INDEX CONCURRENTLY orders_open_recent_idx
+ON orders (merchant_id, created_at DESC)
+INCLUDE (id, total_cents, status)
+WHERE status = 'open';</code></pre>
+        <p>This is not magic syntax. It is a workload argument:</p>
+        <ol>
+          <li><code>merchant_id</code> is the leading equality filter, so the index can jump into one merchant's range.</li>
+          <li><code>created_at DESC</code> matches the requested order, so PostgreSQL may avoid a separate sort.</li>
+          <li><code>WHERE status = 'open'</code> makes it a partial index over the hot subset, as described in the <a href="https://www.postgresql.org/docs/current/indexes-partial.html">partial index documentation</a>.</li>
+          <li><code>INCLUDE</code> columns can help narrow output avoid table visits, but PostgreSQL warns that included columns duplicate data and can bloat the index.</li>
+        </ol>
+        <p>The <a href="https://www.postgresql.org/docs/current/indexes-multicolumn.html">multicolumn index documentation</a> is the key source here: a B-tree index is most efficient when query constraints match the leading columns. In practice, put equality filters that strongly partition the search before the range or ordering column you want to page through.</p>
+      </section>
+
+      <section>
+        <h2>Do Not Worship Index Scans</h2>
+        <p>A sequential scan is not automatically bad. If a query needs most of a table, reading the table directly can beat random index-driven heap lookups. PostgreSQL's EXPLAIN examples show the planner switching among sequential scans, bitmap scans, index scans, hash joins, merge joins, and sorts based on estimated cost.</p>
+        <div class="principle">
+          <p><strong>Production rule:</strong> the plan is good if it does the least necessary work for the current data shape and workload.</p>
+          <p>An index that helps one endpoint can hurt another path by slowing inserts, updates, deletes, vacuum, replication, cache residency, and backup size. For high-write tables such as events, idempotency attempts, jobs, and ledger rows, every extra index is part of the write path.</p>
+        </div>
+      </section>
+
+      <section>
+        <h2>When the Planner Is Wrong</h2>
+        <p>The planner estimates selectivity: how many rows will match each condition. PostgreSQL's <a href="https://www.postgresql.org/docs/current/planner-stats.html">planner statistics documentation</a> explains that these estimates come from approximate statistics updated by <code>ANALYZE</code> and <code>VACUUM ANALYZE</code>. Statistics can be stale, or they can miss relationships between columns.</p>
+        <div class="map">
+          <p><strong>Common bad-estimate shape:</strong></p>
+          <pre><code>WHERE merchant_id = $1
+  AND region = 'us-east'
+  AND status = 'open'
+
+The planner may assume these predicates are independent.
+In reality, one large merchant might dominate open orders in one region.</code></pre>
+        </div>
+        <p>The fix might be an index, but it might also be fresh <code>ANALYZE</code>, better statistics, a query rewrite, or moving a high-fanout read to a projection built in earlier lessons. Do not solve every database performance problem by adding another B-tree.</p>
+      </section>
+
+      <section>
+        <h2>Rollout Is Part of the Design</h2>
+        <p>On a large live table, a standard index build can block writes. The <a href="https://www.postgresql.org/docs/current/sql-createindex.html">CREATE INDEX</a> docs explain that <code>CONCURRENTLY</code> builds without locks that prevent concurrent inserts, updates, or deletes, although it has caveats and still consumes resources.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Concern</th>
+              <th>Production habit</th>
+              <th>Metric or check</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Build pressure</td>
+              <td>Schedule with I/O headroom and watch progress.</td>
+              <td>Disk I/O, CPU, replication lag, progress view.</td>
+            </tr>
+            <tr>
+              <td>Write overhead</td>
+              <td>Compare insert/update latency before and after.</td>
+              <td>p95/p99 write latency, WAL volume, lock waits.</td>
+            </tr>
+            <tr>
+              <td>Planner choice</td>
+              <td>Confirm the post-change plan uses the intended path.</td>
+              <td><code>EXPLAIN (ANALYZE, BUFFERS)</code> before and after.</td>
+            </tr>
+            <tr>
+              <td>Maintenance</td>
+              <td>Keep autovacuum and statistics healthy.</td>
+              <td>dead tuples, analyze age, vacuum activity, bloat.</td>
+            </tr>
+            <tr>
+              <td>Unused index</td>
+              <td>Verify real usage before keeping it forever.</td>
+              <td><code>pg_stat_user_indexes</code>, query latency, I/O.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>PostgreSQL's <a href="https://www.postgresql.org/docs/current/routine-vacuuming.html">routine vacuuming</a> guide connects this to operations: vacuuming reclaims dead row space, updates planner statistics, and supports visibility information used by some index-only scans. Database performance is not static after the migration lands.</p>
+      </section>
+
+      <section>
+        <h2>How to Defend the Resume Bullet</h2>
+        <p>Suppose someone asks: "You said you optimized a slow dashboard query. What did you actually do?" A strong answer sounds like a diagnosis, not a slogan.</p>
+        <div class="principle">
+          <p><strong>Strong answer shape:</strong></p>
+          <ol>
+            <li>The slow path was the merchant open-orders dashboard, where large merchants saw high p95 latency.</li>
+            <li><code>EXPLAIN ANALYZE</code> showed PostgreSQL scanning many merchant rows, filtering by status, sorting by creation time, then returning only 50.</li>
+            <li>We added a partial multicolumn index on <code>(merchant_id, created_at DESC)</code> for open orders, with narrow included columns for the response.</li>
+            <li>The index matched the equality filter, hot subset, order, and limit, so the database could stop after the first page instead of sorting a large candidate set.</li>
+            <li>We built it concurrently, monitored I/O and replication lag, compared before/after plans, and watched read latency, write latency, and index usage.</li>
+            <li>We accepted the storage and write overhead because the endpoint was hot and the indexed subset was small.</li>
+          </ol>
+        </div>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. Which mismatch often explains a bad query plan?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Bad row estimates often lead the planner toward the wrong scan, join, or sort strategy.">estimated rows versus actual rows</button>
+            <button data-correct="false" data-why="">declared locks versus actual waits</button>
+            <button data-correct="false" data-why="">stored bytes versus returned bytes</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. For <code>(merchant_id, created_at)</code>, what shape best uses the leading key?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Leading equality narrows the range before PostgreSQL walks the ordered time values.">merchant equality before time range</button>
+            <button data-correct="false" data-why="">time range before merchant equality</button>
+            <button data-correct="false" data-why="">status output before limit count</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. In a plan, what does a filter after a scan usually mean?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">predicate checked before row access</button>
+            <button data-correct="true" data-why="Correct. The row was reached by the node, then the filter decided whether to emit it.">predicate checked after row access</button>
+            <button data-correct="false" data-why="">predicate ignored during query planning</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. Why use a partial index for open orders?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">all rows lock faster</button>
+            <button data-correct="false" data-why="">old rows vanish automatically</button>
+            <button data-correct="true" data-why="Correct. Indexing only the hot subset can keep the structure smaller and cheaper to maintain.">hot subset stays smaller</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required. These are the checks that show whether you can reason about database performance as production engineering:</p>
+        <ol>
+          <li>Why is "add an index" not a complete diagnosis?</li>
+          <li>What is the difference between <code>Index Cond</code> and <code>Filter</code>?</li>
+          <li>Why can a sequential scan be the right plan?</li>
+          <li>How does <code>ORDER BY ... LIMIT</code> change index design?</li>
+          <li>When might fresh statistics help more than a new index?</li>
+          <li>What production risks should you watch while building an index on a live table?</li>
+        </ol>
+        <div class="callout">
+          <p><strong>Concise answer key:</strong> name the query path and access pattern; <code>Index Cond</code> restricts index access while <code>Filter</code> checks reached rows; broad reads can favor sequential scans; order plus limit rewards an index that can emit the first page directly; bad estimates can come from stale or insufficient statistics; watch locks, I/O, replication lag, write latency, query plans, and index usage.</p>
+        </div>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. Useful performance questions here are: "What changed in the plan?", "Were estimates close to actuals?", "Does the index match the query order?", "What write cost did we add?", and "How did we prove it helped?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://www.postgresql.org/docs/current/using-explain.html">PostgreSQL Documentation: Using EXPLAIN</a></li>
+          <li><a href="https://www.postgresql.org/docs/current/indexes.html">PostgreSQL Documentation: Indexes</a></li>
+          <li><a href="https://www.postgresql.org/docs/current/indexes-multicolumn.html">PostgreSQL Documentation: Multicolumn Indexes</a></li>
+          <li><a href="https://www.postgresql.org/docs/current/indexes-partial.html">PostgreSQL Documentation: Partial Indexes</a></li>
+          <li><a href="https://www.postgresql.org/docs/current/planner-stats.html">PostgreSQL Documentation: Statistics Used by the Planner</a></li>
+          <li><a href="https://www.postgresql.org/docs/current/sql-createindex.html">PostgreSQL Documentation: CREATE INDEX</a></li>
+          <li><a href="https://www.postgresql.org/docs/current/routine-vacuuming.html">PostgreSQL Documentation: Routine Vacuuming</a></li>
+          <li><a href="https://www.postgresql.org/docs/current/monitoring-stats.html">PostgreSQL Documentation: Monitoring Statistics</a></li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
