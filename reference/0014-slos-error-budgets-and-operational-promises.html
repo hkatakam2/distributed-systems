@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: SLOs, Error Budgets, and Operational Promises</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0014</div>
+        <h1>SLOs, Error Budgets, and Operational Promises</h1>
+        <p class="lede">A compact checklist for turning user-visible behavior into SLIs, SLOs, error budgets, alerts, and engineering decisions.</p>
+      </header>
+
+      <section>
+        <h2>The Recurring Shape</h2>
+        <div class="flow">
+          <div><strong>Promise</strong>Name the user journey and the behavior that must be reliable.</div>
+          <div><strong>SLI</strong>Define good events divided by eligible total events.</div>
+          <div><strong>Target</strong>Choose a threshold, objective percentage, and time window.</div>
+          <div><strong>Budget</strong>Translate tolerated unreliability into allowed bad events.</div>
+          <div><strong>Action</strong>Alert, slow releases, mitigate, or invest based on burn.</div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Vocabulary</h2>
+        <p><strong>SLI:</strong> service level indicator; a quantitative measure of service behavior users care about.</p>
+        <p><strong>SLO:</strong> service level objective; the target range or percentage for an SLI over a time window.</p>
+        <p><strong>SLA:</strong> service level agreement; an external or contractual commitment, often with business consequences.</p>
+        <p><strong>SLI specification:</strong> the behavior you intend to measure, independent of a telemetry source.</p>
+        <p><strong>SLI implementation:</strong> the concrete measurement source, such as load balancer logs, client telemetry, traces, probes, or database checks.</p>
+        <p><strong>Good event:</strong> an eligible user interaction, request, record, or view that satisfied the promised condition.</p>
+        <p><strong>Total event:</strong> all eligible events that should be judged by this SLO.</p>
+        <p><strong>Error budget:</strong> the tolerated amount of bad service during the SLO window.</p>
+        <p><strong>Burn rate:</strong> how fast the service is consuming error budget relative to the planned rate.</p>
+        <p><strong>Freshness SLI:</strong> the proportion of user-visible reads or records updated within an accepted age threshold.</p>
+        <p><strong>Coverage SLI:</strong> the proportion of expected input records successfully processed within a target window.</p>
+        <p><strong>Correctness SLI:</strong> the proportion of outputs that match an independent expectation or validation sample.</p>
+      </section>
+
+      <section>
+        <h2>SLI Pattern Table</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>System shape</th>
+              <th>Useful SLI form</th>
+              <th>Common trap</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Request API</td>
+              <td>Good requests under latency threshold / eligible requests.</td>
+              <td>Counting only server-side successes and missing client-visible failures.</td>
+            </tr>
+            <tr>
+              <td>Checkout write</td>
+              <td>Correct commits or explicit valid rejects under deadline / eligible attempts.</td>
+              <td>Treating every non-2xx response as bad when some rejects are correct product behavior.</td>
+            </tr>
+            <tr>
+              <td>Streaming projection</td>
+              <td>User-visible fresh views / total projection views.</td>
+              <td>Using Kafka lag alone when users care about visible state age.</td>
+            </tr>
+            <tr>
+              <td>Batch or stream pipeline</td>
+              <td>Records processed correctly within window / expected records.</td>
+              <td>Measuring worker health but not output coverage or correctness.</td>
+            </tr>
+            <tr>
+              <td>Storage system</td>
+              <td>Writes later readable and intact / accepted writes.</td>
+              <td>Reporting aggregate durability while the hot data users need is unavailable.</td>
+            </tr>
+            <tr>
+              <td>Graceful degradation</td>
+              <td>Undegraded useful responses / eligible responses.</td>
+              <td>Calling every HTTP 200 good even when the answer omits required data.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Formula Sheet</h2>
+        <div class="map">
+          <pre><code>SLI = good events / total eligible events
+
+bad event budget = total eligible events x (1 - SLO target)
+
+observed bad rate = bad events / total eligible events
+
+budgeted bad rate = 1 - SLO target
+
+burn rate = observed bad rate / budgeted bad rate
+
+remaining budget = allowed bad events - observed bad events</code></pre>
+        </div>
+        <p>Example: 99.9% over 10,000,000 eligible requests allows 10,000 bad requests in the window. A 1% observed bad rate burns a 99.9% SLO at 10x because the budgeted bad rate is 0.1%.</p>
+      </section>
+
+      <section>
+        <h2>Design Checklist</h2>
+        <ol>
+          <li>Name the user group and user journey.</li>
+          <li>State the product promise in plain language.</li>
+          <li>Define eligible events: route, tenant, method, status class, or business action.</li>
+          <li>Define what counts as a good event.</li>
+          <li>Choose the threshold: latency, freshness age, correctness, coverage, or durability.</li>
+          <li>Pick the window: rolling 7 days, rolling 30 days, calendar month, or another defensible period.</li>
+          <li>Choose the SLI implementation and list its blind spots.</li>
+          <li>Write the error budget policy before the first incident.</li>
+          <li>Alert on fast budget burn; ticket slow burn; dashboard component causes for diagnosis.</li>
+          <li>Review after incidents, major launches, and sustained mismatch between user pain and SLO status.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Budget Policy Table</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Budget state</th>
+              <th>Engineering posture</th>
+              <th>Decision rule</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Healthy budget</td>
+              <td>Ship normally with standard rollout safety.</td>
+              <td>Feature velocity is acceptable because reliability is inside the promise.</td>
+            </tr>
+            <tr>
+              <td>Fast burn</td>
+              <td>Page, mitigate, shed load, roll back, or degrade deliberately.</td>
+              <td>The service is spending too much budget too quickly to wait.</td>
+            </tr>
+            <tr>
+              <td>Slow burn</td>
+              <td>Create a ticket, investigate trend, and plan reliability work.</td>
+              <td>The SLO may be missed if the issue continues, but immediate paging may not help.</td>
+            </tr>
+            <tr>
+              <td>Budget exhausted</td>
+              <td>Freeze risky launches, repay reliability debt, and review the policy.</td>
+              <td>The team has already spent the unreliability it agreed users could tolerate.</td>
+            </tr>
+            <tr>
+              <td>SLO never burns</td>
+              <td>Check whether the SLO is too loose, too hidden, or measuring the wrong journey.</td>
+              <td>A silent SLO is not useful if users still feel pain.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Answer Shape</h2>
+        <div class="principle">
+          <p><strong>When defending SLO work:</strong></p>
+          <ol>
+            <li>Start with the user promise, not the dashboard.</li>
+            <li>Define the SLI as good events over eligible total events.</li>
+            <li>Explain the threshold, window, and target as product tradeoffs.</li>
+            <li>State the measurement source and what it misses.</li>
+            <li>Translate the target into an error budget.</li>
+            <li>Explain what happens during healthy budget, fast burn, slow burn, and exhausted budget.</li>
+            <li>Connect symptoms to causes with traces, logs, database waits, cache hit rate, lag, and deployment history.</li>
+          </ol>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
