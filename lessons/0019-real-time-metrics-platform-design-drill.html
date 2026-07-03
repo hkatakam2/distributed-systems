@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0019: Real-Time Metrics Platform Design Drill</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0019</div>
+        <h1>Real-Time Metrics Platform Design Drill</h1>
+        <p class="lede">The nineteenth mental model: a real-time metrics system is not a faster batch job. It is a derived-data contract with explicit metric semantics, event ordering, stateful recovery, serving freshness, and correctness evidence.</p>
+        <p class="compact">Mission link: this is the design defense behind delivering sub-30s MRR and churn metrics for 1M+ merchant accounts using Kafka, Flink, Redis, and production SLOs.</p>
+      </header>
+
+      <section>
+        <h2>Where This Fits</h2>
+        <p><a href="0018-rag-pipelines-retrieval-grounding-and-evals.html">Lesson 0018</a> handled AI retrieval pipelines. This lesson zooms back out to the core backend path: source-of-truth facts, event logs, stateful stream processing, materialized serving state, observability, repair, and design defense.</p>
+        <p>Keep <a href="../reference/0019-real-time-metrics-platform-design-drill.html">Reference 0019: Real-Time Metrics Platform</a> nearby. It is the compact checklist for this drill.</p>
+      </section>
+
+      <section>
+        <h2>Concise Answers From Lesson 0018</h2>
+        <ol>
+          <li><strong>Vector indexing is not quality:</strong> it creates retrieval candidates, not authority, permission, freshness, or grounding.</li>
+          <li><strong>Corpus metadata matters:</strong> source type, version, product area, date, tenant, trace ID, owner, and sensitivity control retrieval.</li>
+          <li><strong>Precision@5 and faithfulness split failures:</strong> precision@5 checks retrieved chunks; faithfulness checks generated claims against retrieved evidence.</li>
+          <li><strong>Abstention is a feature:</strong> the assistant should refuse or ask for evidence when context is missing, stale, unauthorized, or contradictory.</li>
+          <li><strong>Production RAG has production signals:</strong> watch index freshness, retrieval relevance, answer feedback, latency, cost, error rate, and regression evals.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>The Big Idea</h2>
+        <p>A real-time metrics platform maintains derived data. The product promise is not "we used Flink." The product promise is closer to: "For each merchant, dashboard MRR and churn reflect accepted billing lifecycle facts within 30 seconds, with known correction behavior and a repair path."</p>
+        <p><a href="https://kafka.apache.org/43/design/design/">Kafka's design documentation</a> frames logs as partitioned, ordered histories where consumers track offsets and can rewind for replay. <a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/stateful-stream-processing/">Flink's stateful stream processing docs</a> explain that stateful operators remember information across events, and its checkpointing model combines stream replay with state snapshots for recovery. <a href="https://sre.google/sre-book/service-level-objectives/">Google's SRE SLO chapter</a> is the operational anchor: choose indicators that represent what users actually care about.</p>
+        <div class="map">
+          <p><strong>Derived-data contract:</strong></p>
+          <pre><code>metric definition
+  -> accepted source facts
+  -> ordered event history
+  -> stateful aggregation
+  -> materialized serving state
+  -> freshness and correctness SLOs
+  -> replay, audit, and repair path</code></pre>
+        </div>
+        <p>The trap is starting with the pipeline diagram. Start with the metric contract. If "churn" means different things to product, finance, support, and engineering, low latency only makes the wrong answer arrive faster.</p>
+      </section>
+
+      <section>
+        <h2>Scenario: Merchant Billing Metrics</h2>
+        <p>You are designing a platform that serves MRR and churn metrics for 1M+ merchant accounts. The previous batch system updated once per day. The new product requirement is sub-30s freshness for dashboards, alerts, and support workflows.</p>
+        <div class="flow">
+          <div><strong>Facts</strong>Billing lifecycle events.</div>
+          <div><strong>Log</strong>Kafka partitioned history.</div>
+          <div><strong>Compute</strong>Flink stateful operator.</div>
+          <div><strong>Serve</strong>Redis materialized view.</div>
+          <div><strong>Evidence</strong>Freshness, audits, replay.</div>
+        </div>
+        <p>This is a good cumulative drill because almost every previous lesson appears: safe writes, outbox publication, partitions, replay, stream state, serving caches, observability, SLOs, capacity, incidents, deployment safety, schema compatibility, and architecture review.</p>
+      </section>
+
+      <section>
+        <h2>Step 1: Define the Metric Before the Pipeline</h2>
+        <p>Metric semantics are part of the system design. MRR and churn are business concepts that need engineering definitions precise enough to implement, test, replay, and explain.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Question</th>
+              <th>Why it matters</th>
+              <th>Contract example</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>What fact changes MRR?</td>
+              <td>Prevents support notes, retries, or partial attempts from changing revenue.</td>
+              <td>Only accepted subscription lifecycle facts update metric state.</td>
+            </tr>
+            <tr>
+              <td>What counts as churn?</td>
+              <td>Separates cancellation intent, failed payment, grace period, and actual lost revenue.</td>
+              <td>Churn starts when the subscription reaches a terminal unpaid or canceled state.</td>
+            </tr>
+            <tr>
+              <td>Which time matters?</td>
+              <td>Event time and processing time answer different questions during lag and backfill.</td>
+              <td>Business reporting uses effective event time; freshness uses processing time.</td>
+            </tr>
+            <tr>
+              <td>How are corrections handled?</td>
+              <td>Real systems receive reversals, late events, manual fixes, and schema changes.</td>
+              <td>Corrections emit new facts and recompute affected subscription and merchant state.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>This is where senior judgment shows up early. Before debating partitions or Redis TTLs, force the product promise into a metric contract that can survive retries, late events, replays, and support escalations.</p>
+      </section>
+
+      <section>
+        <h2>Step 2: Name the Ordering Boundary</h2>
+        <p>Kafka gives order within a partition, not global order across the whole company. A billing lifecycle pipeline should say which entity needs ordered transitions. If subscription state changes must be interpreted in order, the event key should preserve order for that subscription. If merchant aggregates are the serving target, the stream may need a second keyed aggregation by merchant.</p>
+        <div class="principle">
+          <p><strong>Two-stage shape:</strong> first normalize and dedupe subscription lifecycle facts keyed by subscription ID; then aggregate merchant metrics keyed by merchant ID.</p>
+          <p><strong>Why:</strong> subscription ordering protects state-machine correctness, while merchant keying puts all merchant-level metric updates in the place that owns the merchant aggregate.</p>
+        </div>
+        <p>The design decision is not "partition by merchant" or "partition by subscription" in the abstract. It is: what must be sequential for correctness, what must be colocated for aggregation, and where will repartitioning cost, skew, and failure recovery appear?</p>
+      </section>
+
+      <section>
+        <h2>Step 3: Treat Stream State as Recoverable Memory</h2>
+        <p>A Flink operator can keep per-subscription state, per-merchant aggregate state, timers, watermarks, and correction metadata. That state is valuable because it prevents every dashboard read from re-scanning the billing ledger. It is risky because bugs, late events, and sink failures can preserve the wrong answer quickly.</p>
+        <p>Flink's checkpointing documentation says state needs checkpoints so recovery can restore state and stream positions with failure-free semantics. The practical design question is what happens at the sink boundary: did the Redis or database write happen once, twice, or not at all after a failure?</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Risk</th>
+              <th>Control</th>
+              <th>Evidence</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Duplicate event after replay changes totals twice.</td>
+              <td>Event ID dedupe, versioned state update, idempotent sink write.</td>
+              <td>Replay test, duplicate count, aggregate checksum.</td>
+            </tr>
+            <tr>
+              <td>Late correction arrives after dashboard state moved forward.</td>
+              <td>Correction event contract, bounded lateness policy, affected-key recompute.</td>
+              <td>Correction age, recompute count, audit diff size.</td>
+            </tr>
+            <tr>
+              <td>Checkpoint recovery replays records already written to Redis.</td>
+              <td>Upsert by metric key and version, not blind increments.</td>
+              <td>Sink idempotency test and version conflict metric.</td>
+            </tr>
+            <tr>
+              <td>Hot merchant creates skew and lag.</td>
+              <td>Skew detection, split aggregate strategy, tenant throttles, capacity review.</td>
+              <td>Lag age by key cohort and task busy time.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>Exactly-once processing is a system-level claim, not a magic adjective. You defend it by explaining the source offsets, checkpointed state, sink behavior, and what the system does when replay crosses an external side effect.</p>
+      </section>
+
+      <section>
+        <h2>Step 4: Materialize for Reads Without Moving Truth</h2>
+        <p>Redis can make dashboard reads fast, but it should not become the only place where metric truth exists. Treat it as a serving projection with a freshness timestamp, source version, and rebuild path.</p>
+        <p>The <a href="https://redis.io/docs/latest/develop/reference/eviction/">Redis eviction docs</a> describe cache entries as copies of persistently stored data and expose hit/miss and eviction signals through runtime info. The <a href="https://redis.io/docs/latest/commands/expire/">Redis EXPIRE command</a> attaches timeouts so keys can be automatically deleted. For this platform, TTLs and eviction are serving controls, not correctness mechanisms.</p>
+        <div class="map">
+          <p><strong>Metric read response:</strong></p>
+          <pre><code>{
+  "merchant_id": "m_123",
+  "mrr_cents": 8120000,
+  "churned_subscriptions_30d": 41,
+  "computed_at": "2026-06-30T14:03:22Z",
+  "source_watermark": "2026-06-30T14:03:10Z",
+  "pipeline_version": "billing-metrics-v7"
+}</code></pre>
+        </div>
+        <p>Those extra fields make staleness observable. A dashboard, support tool, or on-call engineer can tell whether the answer is fresh, stale, rebuilding, or from an old pipeline version.</p>
+      </section>
+
+      <section>
+        <h2>Step 5: Make Freshness and Correctness Separate</h2>
+        <p>Fresh and wrong is not success. Correct and one day late may also fail the product. Define both.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Promise</th>
+              <th>Useful SLI</th>
+              <th>Likely alert or review</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Dashboard freshness</td>
+              <td>Age of metric response at read time.</td>
+              <td>Page if P99 freshness exceeds 30s for active merchants.</td>
+            </tr>
+            <tr>
+              <td>Pipeline progress</td>
+              <td>Event-time watermark lag and Kafka lag age.</td>
+              <td>Ticket on sustained lag before user freshness burns.</td>
+            </tr>
+            <tr>
+              <td>Metric correctness</td>
+              <td>Diff against authoritative batch or ledger audit.</td>
+              <td>Block rollout if sampled merchant diffs exceed tolerance.</td>
+            </tr>
+            <tr>
+              <td>Recovery readiness</td>
+              <td>Time to replay or rebuild affected merchant projections.</td>
+              <td>Review after replay drill or incident repair miss.</td>
+            </tr>
+            <tr>
+              <td>Serving health</td>
+              <td>Redis hit rate, key age, eviction count, API P95.</td>
+              <td>Alert only when it threatens the user promise.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>Google's SRE framing matters here: pick a few indicators that represent real user needs. For a real-time metrics platform, freshness, correctness, and availability usually matter more than whether every internal component has a green dashboard.</p>
+      </section>
+
+      <section>
+        <h2>Step 6: Defend the Resume Bullet</h2>
+        <p>If someone asks how you delivered sub-30s MRR and churn metrics, avoid reciting technology names. Make the derived-data contract explicit.</p>
+        <div class="principle">
+          <p><strong>Weak answer:</strong> "We used Kafka, Flink, and Redis to make metrics real time."</p>
+          <p><strong>Strong answer:</strong> "We first made MRR and churn precise enough to compute from accepted billing lifecycle facts, including effective time and correction behavior. Kafka carried replayable events keyed to preserve subscription ordering, then Flink maintained subscription and merchant aggregate state with checkpoints. Redis served merchant metrics as a materialized read model, but every value included computed-at, watermark, and pipeline-version metadata so stale answers were visible. The main tradeoff was eventual consistency, so we separated freshness SLOs from correctness audits, tracked lag age, checkpoint health, sink idempotency, Redis hit rate, and batch-vs-stream diffs, and kept replay and rebuild runbooks for repair."</p>
+        </div>
+        <p>That answer is defensible because it connects product semantics, distributed systems mechanics, tradeoffs, and evidence.</p>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. What comes before stream topology?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. The metric contract defines what facts, time semantics, and corrections the pipeline must honor.">metric contract</button>
+            <button data-correct="false" data-why="">cluster fashion</button>
+            <button data-correct="false" data-why="">library catalog</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. What does partitioning protect?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">random dashboard color</button>
+            <button data-correct="true" data-why="Correct. Partitioning protects the order needed by a specific entity, such as a subscription lifecycle.">entity event order</button>
+            <button data-correct="false" data-why="">generic resume phrase</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. What makes replay safer?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Idempotent sink writes prevent replay from blindly double-applying external effects.">idempotent sink write</button>
+            <button data-correct="false" data-why="">unbounded retry storm</button>
+            <button data-correct="false" data-why="">untested schema patch</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. What should Redis values expose?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">decorative homepage</button>
+            <button data-correct="false" data-why="">ambiguous success</button>
+            <button data-correct="true" data-why="Correct. Freshness metadata lets users and operators tell whether the read model is current enough.">freshness metadata</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>5. Which check catches correctness drift?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">average cpu percent</button>
+            <button data-correct="true" data-why="Correct. Batch audit diffs compare stream-derived metrics against an authoritative reference path.">batch audit diffs</button>
+            <button data-correct="false" data-why="">button border radius</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required. These are the checks that show whether you can defend a real-time derived-data system rather than list tools:</p>
+        <ol>
+          <li>What exact fact changes MRR, and what fact changes churn?</li>
+          <li>Which entity needs ordered events, and which entity owns the final aggregate?</li>
+          <li>Why is a Redis materialization not the source of truth?</li>
+          <li>How can the pipeline be fresh but wrong?</li>
+          <li>What evidence would you show after a replay to prove metrics were repaired?</li>
+          <li>How would you answer if someone challenged "exactly once" at the Redis sink boundary?</li>
+        </ol>
+        <div class="callout">
+          <p><strong>Concise answer key:</strong> only accepted billing lifecycle facts should change metrics; subscription ID often protects lifecycle ordering while merchant ID owns the aggregate; Redis is a fast projection that can be evicted, stale, or rebuilt; fresh-but-wrong happens when the stream quickly applies bad semantics, duplicates, missed corrections, or schema mistakes; replay repair needs audit diffs, checksums, affected-key counts, freshness recovery, and sink conflict metrics; exactly-once defense must name source offsets, checkpointed state, idempotent or transactional sink behavior, and replay tests.</p>
+        </div>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. Useful review questions here are: "What does this metric mean?", "Where is the ordering boundary?", "Can this side effect replay safely?", "How stale is this answer?", and "What proves the derived state matches truth?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://kafka.apache.org/43/design/design/">Apache Kafka Design Documentation</a></li>
+          <li><a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/stateful-stream-processing/">Apache Flink Documentation: Stateful Stream Processing</a></li>
+          <li><a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/fault-tolerance/checkpointing/">Apache Flink Documentation: Checkpointing</a></li>
+          <li><a href="https://redis.io/docs/latest/develop/reference/eviction/">Redis Documentation: Key Eviction</a></li>
+          <li><a href="https://redis.io/docs/latest/commands/expire/">Redis Command Documentation: EXPIRE</a></li>
+          <li><a href="https://sre.google/sre-book/service-level-objectives/">Google SRE Book: Service Level Objectives</a></li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>

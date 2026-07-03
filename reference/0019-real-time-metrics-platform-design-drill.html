@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: Real-Time Metrics Platform</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0019</div>
+        <h1>Real-Time Metrics Platform</h1>
+        <p class="lede">A compact checklist for designing, operating, and defending a stream-powered metrics platform with fresh, correct, repairable derived data.</p>
+      </header>
+
+      <section>
+        <h2>Core Rule</h2>
+        <div class="principle">
+          <p><strong>Real-time metrics are a derived-data contract, not a tool stack.</strong></p>
+          <p>Defend the contract by naming metric semantics, source facts, event ordering, stateful aggregation, serving materialization, freshness, correctness, replay, and evidence.</p>
+        </div>
+      </section>
+
+      <section>
+        <h2>Pipeline Shape</h2>
+        <div class="map">
+          <pre><code>accepted billing facts
+  -> transactional publication or CDC
+  -> Kafka topic keyed for ordering
+  -> dedupe and normalize stream
+  -> subscription state update
+  -> merchant aggregate update
+  -> Redis or database projection upsert
+  -> dashboard read with freshness metadata
+  -> audit, replay, and repair</code></pre>
+        </div>
+      </section>
+
+      <section>
+        <h2>Vocabulary</h2>
+        <p><strong>Metric contract:</strong> the precise definition of what changes a metric, which time semantics apply, and how corrections are handled.</p>
+        <p><strong>Source fact:</strong> a durable accepted business event, not an attempted request or temporary support note.</p>
+        <p><strong>Ordering boundary:</strong> the entity whose events must be sequential for correctness, often subscription, account, order, or SKU.</p>
+        <p><strong>Derived state:</strong> state computed from source facts, such as per-subscription lifecycle state or per-merchant MRR.</p>
+        <p><strong>Materialized read model:</strong> precomputed serving state optimized for reads, usually rebuildable from source history.</p>
+        <p><strong>Freshness:</strong> how old the visible metric is when read.</p>
+        <p><strong>Correctness audit:</strong> comparison between stream-derived output and an authoritative reference such as ledger or batch recomputation.</p>
+        <p><strong>Replay:</strong> re-consuming source history to rebuild or repair derived state.</p>
+      </section>
+
+      <section>
+        <h2>Design Checklist</h2>
+        <ol>
+          <li>Define the metric before choosing the streaming topology.</li>
+          <li>Identify the accepted source facts and reject non-authoritative inputs.</li>
+          <li>Choose event keys based on required ordering, not convenience.</li>
+          <li>Decide where repartitioning is needed for aggregate ownership.</li>
+          <li>Make dedupe and correction behavior explicit.</li>
+          <li>Checkpoint state and prove sink writes are replay-safe.</li>
+          <li>Materialize reads with computed-at, watermark, and pipeline-version metadata.</li>
+          <li>Separate freshness SLOs from correctness audits.</li>
+          <li>Track lag, backpressure, checkpoint duration, sink conflicts, Redis hit rate, and audit diffs.</li>
+          <li>Keep runbooks for replay, rebuild, rollback, and affected-merchant repair.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>State Table</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>State</th>
+              <th>Purpose</th>
+              <th>Recovery question</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Billing ledger or lifecycle facts</td>
+              <td>Authoritative source of accepted business changes.</td>
+              <td>Can every metric be recomputed from these facts?</td>
+            </tr>
+            <tr>
+              <td>Kafka log</td>
+              <td>Ordered replayable event history within partitions.</td>
+              <td>Is retention long enough for rebuild and audit needs?</td>
+            </tr>
+            <tr>
+              <td>Flink operator state</td>
+              <td>Per-key memory for subscriptions, aggregates, timers, and corrections.</td>
+              <td>Are checkpoints healthy, restorable, and compatible with new code?</td>
+            </tr>
+            <tr>
+              <td>Redis projection</td>
+              <td>Low-latency dashboard serving state.</td>
+              <td>Can keys be rebuilt after eviction, corruption, or deployment rollback?</td>
+            </tr>
+            <tr>
+              <td>Audit outputs</td>
+              <td>Evidence that derived metrics match authoritative truth.</td>
+              <td>Can diffs be attributed to specific facts, keys, and pipeline versions?</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Failure Matrix</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Failure</th>
+              <th>Likely cause</th>
+              <th>Control</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Metric is fresh but wrong.</td>
+              <td>Bad metric semantics, duplicate events, missed corrections, schema bug.</td>
+              <td>Audit diffs, replay tests, schema compatibility checks, correction contract.</td>
+            </tr>
+            <tr>
+              <td>Metric is correct but stale.</td>
+              <td>Kafka lag, Flink backpressure, slow sink, checkpoint pressure.</td>
+              <td>Freshness SLO, lag-age alerts, checkpoint monitoring, sink scaling.</td>
+            </tr>
+            <tr>
+              <td>Replay double-counts revenue.</td>
+              <td>Blind increments or non-idempotent sink writes.</td>
+              <td>Upserts by metric key and version, event dedupe, checksum verification.</td>
+            </tr>
+            <tr>
+              <td>One merchant delays many others.</td>
+              <td>Skewed key, hot partition, large correction, expensive aggregate.</td>
+              <td>Skew dashboard, split aggregate, tenant throttles, bounded repair queue.</td>
+            </tr>
+            <tr>
+              <td>Dashboard hides stale data.</td>
+              <td>No freshness metadata in materialized values.</td>
+              <td>Return computed-at, watermark, source version, and stale labels.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>SLI Set</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Concern</th>
+              <th>Signal</th>
+              <th>Decision it supports</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Freshness</td>
+              <td>Age of metric at read time; watermark lag; Kafka lag age.</td>
+              <td>Page, degrade, or show stale label.</td>
+            </tr>
+            <tr>
+              <td>Correctness</td>
+              <td>Batch-vs-stream diff, checksum, sampled ledger audit.</td>
+              <td>Block rollout, replay, or repair affected keys.</td>
+            </tr>
+            <tr>
+              <td>Recovery</td>
+              <td>Replay duration, rebuild duration, failed keys, sink conflicts.</td>
+              <td>Choose repair scope and communicate impact.</td>
+            </tr>
+            <tr>
+              <td>Serving</td>
+              <td>Redis hit rate, evictions, key age, API latency, errors.</td>
+              <td>Tune cache policy or protect source systems.</td>
+            </tr>
+            <tr>
+              <td>Change safety</td>
+              <td>Canary diffs, schema errors, DLQ count, mixed-version behavior.</td>
+              <td>Continue, pause, rollback, or backfill.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Defense Script</h2>
+        <div class="principle">
+          <p><strong>When defending a real-time metrics platform:</strong></p>
+          <ol>
+            <li>Start with the product promise and metric contract.</li>
+            <li>Name the source of truth and accepted source facts.</li>
+            <li>State the ordering boundary and partition or repartition strategy.</li>
+            <li>Explain stateful aggregation, checkpointing, dedupe, and corrections.</li>
+            <li>Explain the materialized read model and freshness metadata.</li>
+            <li>Separate freshness, correctness, serving, and recovery signals.</li>
+            <li>Close with replay, audit, rollback, and ownership.</li>
+          </ol>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
