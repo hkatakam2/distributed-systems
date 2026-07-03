@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: Production Architecture Review</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0016</div>
+        <h1>Production Architecture Review</h1>
+        <p class="lede">A compact checklist for reviewing a backend design as testable claims, failure modes, controls, evidence, and ownership.</p>
+      </header>
+
+      <section>
+        <h2>The Recurring Shape</h2>
+        <div class="flow">
+          <div><strong>Claim</strong>State what the architecture must guarantee for a user journey.</div>
+          <div><strong>Mechanism</strong>Name the component, contract, or pattern that provides the guarantee.</div>
+          <div><strong>Failure</strong>Ask what breaks the claim under traffic, change, duplication, or delay.</div>
+          <div><strong>Control</strong>Add the limit, fallback, invariant, rollout guard, or repair path.</div>
+          <div><strong>Evidence</strong>Define the metric, trace, log, test, or runbook that proves it works.</div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Vocabulary</h2>
+        <p><strong>Architecture claim:</strong> a specific statement about what the system guarantees, such as ordering, freshness, durability, idempotency, replay, or bounded degradation.</p>
+        <p><strong>Mechanism:</strong> the design choice that supports a claim: transaction, constraint, outbox, partition key, checkpoint, cache TTL, canary, timeout, or SLO.</p>
+        <p><strong>Invariant:</strong> a condition that should remain true even under retries, concurrency, failure, replay, or partial deployment.</p>
+        <p><strong>Failure mode:</strong> a concrete way the claim can break.</p>
+        <p><strong>Control:</strong> a prevention, detection, containment, mitigation, or repair mechanism for a failure mode.</p>
+        <p><strong>Evidence:</strong> the observable proof that a claim is currently holding or has failed.</p>
+        <p><strong>Owner:</strong> the person or team responsible for the control, signal, runbook, and repair path.</p>
+      </section>
+
+      <section>
+        <h2>Review Loop</h2>
+        <div class="map">
+          <pre><code>for each critical user journey:
+  write the user promise
+  list the architecture claims that support it
+  for each claim:
+    name the mechanism
+    name the invariant
+    force one likely failure mode
+    choose the control
+    choose the evidence signal
+    assign the owner
+    check the rollback or repair path</code></pre>
+        </div>
+      </section>
+
+      <section>
+        <h2>Five Review Lenses</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Lens</th>
+              <th>Questions</th>
+              <th>Common weak answer</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>User promise</td>
+              <td>Which journey matters? What is good enough? What burns the SLO?</td>
+              <td>"All services are up."</td>
+            </tr>
+            <tr>
+              <td>State</td>
+              <td>Where is truth? What can drift? Which invariant is enforced durably?</td>
+              <td>"Everything is in the database."</td>
+            </tr>
+            <tr>
+              <td>Time</td>
+              <td>What ordering is required? What can be late, replayed, duplicated, or stale?</td>
+              <td>"Kafka handles ordering."</td>
+            </tr>
+            <tr>
+              <td>Failure</td>
+              <td>What happens under retry storms, hot tenants, slow sinks, lost workers, or partial deploys?</td>
+              <td>"We can just retry."</td>
+            </tr>
+            <tr>
+              <td>Operations</td>
+              <td>What signal pages? What runbook repairs? Who owns cleanup and verification?</td>
+              <td>"We have dashboards."</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Claim Table</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Claim</th>
+              <th>Mechanism</th>
+              <th>Evidence</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Accepted commands create at most one fact.</td>
+              <td>Idempotency key, unique constraint, single transaction.</td>
+              <td>Duplicate-command tests, conflict counts, constraint violations.</td>
+            </tr>
+            <tr>
+              <td>Events leave the service after commit.</td>
+              <td>Transactional outbox and retrying publisher.</td>
+              <td>Outbox age, publish lag, stuck rows, consumer receipt.</td>
+            </tr>
+            <tr>
+              <td>Consumers can safely replay.</td>
+              <td>Deterministic processing and idempotent sink writes.</td>
+              <td>Replay drill, duplicate event test, projection checksum.</td>
+            </tr>
+            <tr>
+              <td>Read models are fresh enough.</td>
+              <td>Freshness timestamps, SLO, rebuild path, stale label.</td>
+              <td>View freshness SLI, stale count, lag age, Redis key age.</td>
+            </tr>
+            <tr>
+              <td>Slow dependencies do not cascade.</td>
+              <td>Deadlines, backoff, circuit breaker, degradation.</td>
+              <td>Timeout rate, retry volume, dependency latency, shed count.</td>
+            </tr>
+            <tr>
+              <td>Releases can be stopped or reversed.</td>
+              <td>Canary, compatible schema, feature flag, rollback plan.</td>
+              <td>Canary SLO, error budget burn, rollback drill, mixed-version test.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Evidence Path Template</h2>
+        <div class="map">
+          <pre><code>symptom:
+  user promise:
+  bad event definition:
+  affected cohort:
+
+evidence chain:
+  API:
+  source of truth:
+  event publication:
+  stream processing:
+  serving state:
+  deployment or schema change:
+
+decision:
+  likely failure mode:
+  mitigation:
+  repair path:
+  owner:
+  verification signal:</code></pre>
+        </div>
+      </section>
+
+      <section>
+        <h2>Review Questions</h2>
+        <ol>
+          <li>What is the most important user promise this design makes?</li>
+          <li>Which claim would be most expensive if wrong?</li>
+          <li>Where is the source of truth, and what states are rebuildable?</li>
+          <li>What ordering guarantee is needed, and what partition key provides it?</li>
+          <li>What happens when the same command, event, or batch runs twice?</li>
+          <li>What can be stale, and how does the user or operator know?</li>
+          <li>What backpressure protects the first shared bottleneck?</li>
+          <li>What rollout, schema, or migration path keeps old and new code compatible?</li>
+          <li>What signal pages, what signal tickets, and what signal only helps diagnosis?</li>
+          <li>Who owns replay, DLQ repair, stale data cleanup, and post-incident verification?</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Answer Shape</h2>
+        <div class="principle">
+          <p><strong>When defending an architecture:</strong></p>
+          <ol>
+            <li>Start with the user promise and scale or freshness target.</li>
+            <li>Name the durable source of truth and enforced invariants.</li>
+            <li>Explain how asynchronous work is published, ordered, replayed, and consumed.</li>
+            <li>Explain how serving state is built, bounded, monitored, and repaired.</li>
+            <li>State the biggest tradeoff and why it is acceptable.</li>
+            <li>Name the failure modes and controls.</li>
+            <li>Close with evidence: metrics, tests, SLOs, drills, and incident learnings.</li>
+          </ol>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

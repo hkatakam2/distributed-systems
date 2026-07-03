@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0016: Production Architecture Review</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0016</div>
+        <h1>Production Architecture Review</h1>
+        <p class="lede">The sixteenth mental model: senior backend design is not naming enough tools. It is making explicit claims, backing them with mechanisms, testing the failure modes, and knowing which evidence would prove the system is working.</p>
+        <p class="compact">Mission link: this is the review script for defending resume-style systems across APIs, databases, events, streams, caches, deployments, observability, SLOs, and incidents.</p>
+      </header>
+
+      <section>
+        <h2>Where This Fits</h2>
+        <p><a href="0015-incident-response-triage-and-postmortems.html">Lesson 0015</a> taught how to respond when the user promise is already burning. This lesson moves earlier: how do you review a design before launch, before an interview deep dive, or after a postmortem action item changes the architecture?</p>
+        <p>Keep <a href="../reference/0016-production-architecture-review.html">Reference 0016: Production Architecture Review</a> nearby. It is the compact checklist for this lesson.</p>
+      </section>
+
+      <section>
+        <h2>Concise Answers From Lesson 0015</h2>
+        <ol>
+          <li><strong>Incidents are coordination problems:</strong> responders must coordinate decisions, production changes, communication, evidence, and handoff.</li>
+          <li><strong>Declare before root cause:</strong> user impact, fast burn, multi-team work, or prolonged uncertainty is enough.</li>
+          <li><strong>Mitigate before curiosity:</strong> stop user harm while diagnosis continues.</li>
+          <li><strong>Track live state:</strong> roles, impact, timeline, hypotheses, actions, owners, and next update time belong in the incident document.</li>
+          <li><strong>Rollback is partial:</strong> it can stop new harm while leaving lag, bad data, or cleanup work behind.</li>
+          <li><strong>Postmortems must change systems:</strong> useful action items have an owner, priority, concrete change, and verification signal.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>The Big Idea</h2>
+        <p>A production architecture review should turn a diagram into testable engineering claims. "We use Kafka" is not a claim. "Subscription lifecycle events are ordered by subscription ID, replayable for 30 days, and consumed idempotently into the revenue projection" is a claim. It can be tested, broken, monitored, and defended.</p>
+        <p><a href="https://dataintensive.net/">Designing Data-Intensive Applications</a> is the backbone source here because it repeatedly asks what guarantees a system provides around storage, replication, partitioning, transactions, and derived data. The <a href="https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html">AWS Well-Architected Reliability Pillar</a> is the operational companion: design for failure, test recovery, manage change, and make workloads resilient. The Google SRE chapters on <a href="https://sre.google/sre-book/service-level-objectives/">Service Level Objectives</a> and <a href="https://sre.google/sre-book/effective-troubleshooting/">Effective Troubleshooting</a> turn the same review into user promises and evidence paths.</p>
+        <div class="map">
+          <p><strong>Review loop:</strong></p>
+          <pre><code>claim
+  -> mechanism
+  -> invariant
+  -> failure mode
+  -> control
+  -> evidence
+  -> owner</code></pre>
+        </div>
+        <p>The trap is reviewing boxes instead of promises. A diagram tells you where components sit. A review tells you what must remain true when traffic spikes, messages duplicate, schemas change, caches go stale, queries slow down, rollouts fail, and people respond under pressure.</p>
+      </section>
+
+      <section>
+        <h2>Scenario: Revenue Platform Launch Review</h2>
+        <p>Suppose you are reviewing a subscription revenue platform before launching to larger merchants. The system accepts subscription changes through an API, commits ledger facts in PostgreSQL, publishes outbox events to Kafka, computes projections in Flink, stores serving state in Redis and PostgreSQL projection tables, and exposes merchant dashboards.</p>
+        <div class="flow">
+          <div><strong>API</strong>Commands, idempotency, deadlines.</div>
+          <div><strong>Postgres</strong>Facts, constraints, transactions.</div>
+          <div><strong>Kafka</strong>Ordering, retention, replay.</div>
+          <div><strong>Flink</strong>State, time, checkpoints.</div>
+          <div><strong>Serving</strong>Freshness, cache, projection.</div>
+        </div>
+        <p>A shallow review asks whether each component exists. A useful review asks whether the design survives the specific pressures implied by the product promise: duplicate writes, hot tenants, late events, slow queries, stale dashboards, bad deploys, and recovery after a failed stream sink.</p>
+      </section>
+
+      <section>
+        <h2>Step 1: Start With Promises and Claims</h2>
+        <p>Review from the user journey inward. For each critical journey, state the product promise, then state the architecture claim that supports it. If the claim is vague, the design cannot be defended yet.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>User promise</th>
+              <th>Architecture claim</th>
+              <th>Evidence you need</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Subscription changes commit safely.</td>
+              <td>Each intended command creates at most one durable ledger fact.</td>
+              <td>Idempotency table behavior, unique constraints, transaction boundary, retry tests.</td>
+            </tr>
+            <tr>
+              <td>Dashboard data is fresh enough.</td>
+              <td>Projection age stays under five minutes for 99.5% of dashboard views.</td>
+              <td>Freshness SLI, Redis key age, stream lag age, sink latency, burn alerts.</td>
+            </tr>
+            <tr>
+              <td>Analytics can be repaired.</td>
+              <td>Events can be replayed into projection state without double-counting.</td>
+              <td>Replay runbook, deterministic aggregation, checkpoint behavior, idempotent sinks.</td>
+            </tr>
+            <tr>
+              <td>Releases do not silently corrupt state.</td>
+              <td>Schema and rollout changes are compatible across old and new workers.</td>
+              <td>Compatibility tests, canary coverage, rollback path, migration plan.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>This is where SLO thinking from <a href="0014-slos-error-budgets-and-operational-promises.html">Lesson 0014</a> matters. A review without a user promise becomes a component inventory. A review with promises can prioritize which failures deserve the most design effort.</p>
+      </section>
+
+      <section>
+        <h2>Step 2: Walk State, Time, and Ownership</h2>
+        <p>Most hard backend failures are failures of state, time, or ownership. Something became true in one place but not another. Something happened twice, late, out of order, or before a consumer was ready. Something had no clear owner when repair was needed.</p>
+        <div class="principle">
+          <p><strong>State:</strong> What is the source of truth? Which derived states can drift? What invariant belongs in the database instead of only in application code?</p>
+          <p><strong>Time:</strong> What ordering is required? What can arrive late? What can be replayed? What freshness does the user actually need?</p>
+          <p><strong>Ownership:</strong> Who owns schema compatibility, DLQs, replay, backfills, SLO alerts, runbooks, and cleanup after temporary mitigations?</p>
+        </div>
+        <p>For the revenue platform, the ledger may be source of truth for accepted billing facts, Kafka may be the replayable history for downstream projection, Flink may hold checkpointed derived state, and Redis may hold fast but rebuildable serving state. Those are different kinds of memory. Reviewing them as if they were interchangeable hides the real risk.</p>
+      </section>
+
+      <section>
+        <h2>Step 3: Force Failure Modes Into the Open</h2>
+        <p>A good review asks "what breaks this?" before production does. Tie each failure mode to a control and an evidence signal.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Failure mode</th>
+              <th>Control</th>
+              <th>Evidence</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Client retries duplicate a subscription command.</td>
+              <td>Idempotency key, unique constraint, safe response replay.</td>
+              <td>Duplicate-request test and idempotency conflict metric.</td>
+            </tr>
+            <tr>
+              <td>Outbox publisher crashes after database commit.</td>
+              <td>Durable outbox row, polling publisher, retry with ownership.</td>
+              <td>Outbox age, publish lag, stuck-row alert.</td>
+            </tr>
+            <tr>
+              <td>One merchant creates a hot partition.</td>
+              <td>Partitioning review, per-tenant throttles, skew dashboard.</td>
+              <td>Lag and processing time by partition and tenant cohort.</td>
+            </tr>
+            <tr>
+              <td>Redis serves stale projection state.</td>
+              <td>Freshness timestamp, stale label, rebuild path, bounded TTL.</td>
+              <td>View freshness SLI and stale-response count.</td>
+            </tr>
+            <tr>
+              <td>Deployment changes event shape unsafely.</td>
+              <td>Backward-compatible schema, canary, rollback, dual-read period.</td>
+              <td>Consumer error rate, DLQ count, canary SLO status.</td>
+            </tr>
+            <tr>
+              <td>Database backfill saturates production.</td>
+              <td>Bounded batches, lock monitoring, pause switch, off-peak rollout.</td>
+              <td>WAL rate, lock waits, replica lag, user latency.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Step 4: Review the Evidence Path</h2>
+        <p>Architecture is not production-ready until operators can tell whether the claims are holding. The evidence path should connect user symptoms to component causes without guessing.</p>
+        <div class="map">
+          <p><strong>Evidence chain for stale dashboards:</strong></p>
+          <pre><code>dashboard freshness SLI burns
+  -> affected merchants and response freshness timestamps
+  -> Redis key age and miss rate
+  -> projection table update age and query latency
+  -> Flink sink latency, checkpoint duration, backpressure
+  -> Kafka lag age by partition
+  -> outbox publish lag and recent deploy history</code></pre>
+        </div>
+        <p>This is the same discipline used in incidents, but a review asks for it before the page. If no signal would distinguish Redis staleness from Flink backpressure from PostgreSQL lock waits, the system is not merely under-instrumented; it is hard to operate.</p>
+      </section>
+
+      <section>
+        <h2>Step 5: Make the Design Defensible</h2>
+        <p>When someone challenges the architecture, answer with the review loop rather than a tool list. State the claim, the mechanism, the known tradeoff, and the signal that proves it works.</p>
+        <div class="principle">
+          <p><strong>Weak answer:</strong> "We used Kafka, Flink, Redis, and Kubernetes for scalability."</p>
+          <p><strong>Strong answer:</strong> "We separated durable billing facts from derived dashboard state. PostgreSQL enforced accepted ledger invariants; outbox events made publication retryable; Kafka gave replayable ordered histories by subscription; Flink maintained checkpointed projections; Redis served low-latency reads with freshness timestamps. The main tradeoff was eventual consistency, so we made freshness user-visible, alerted on freshness burn, and kept replay and rebuild paths for repair."</p>
+        </div>
+        <p>Notice the shape: every tool is attached to a problem, every guarantee has a boundary, and every tradeoff has an operational signal.</p>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. What should a review turn diagrams into?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Testable claims can be broken, monitored, and defended.">testable design claims</button>
+            <button data-correct="false" data-why="">decorative tool inventory</button>
+            <button data-correct="false" data-why="">private status theater</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. Which three lenses catch many backend failures?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">colors names icons</button>
+            <button data-correct="true" data-why="Correct. State, time, and ownership reveal drift, ordering, freshness, repair, and responsibility risks.">state time ownership</button>
+            <button data-correct="false" data-why="">slides titles slogans</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. What pairs with each failure mode?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">rumor blame silence</button>
+            <button data-correct="false" data-why="">style budget deadline</button>
+            <button data-correct="true" data-why="Correct. A failure mode is actionable when a control and evidence signal are named.">control evidence owner</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. Why attach tools to claims?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">increase resume density</button>
+            <button data-correct="true" data-why="Correct. Claims explain why the tool exists, what boundary it protects, and how to verify it.">defend system tradeoffs</button>
+            <button data-correct="false" data-why="">avoid operational evidence</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required. These are the checks that show whether you can review a production design rather than just describe it:</p>
+        <ol>
+          <li>Pick one claim in the revenue platform and name its mechanism, invariant, failure mode, control, evidence, and owner.</li>
+          <li>Why is "Kafka makes it scalable" weaker than an ordering and replay claim?</li>
+          <li>Which states are source-of-truth, derived-but-durable, and cache-only in the scenario?</li>
+          <li>What evidence would distinguish a stale Redis cache from a slow Flink sink?</li>
+          <li>What rollout or schema question would you ask before launching the design?</li>
+          <li>How would you turn the strong answer shape into a resume-bullet defense?</li>
+        </ol>
+        <div class="callout">
+          <p><strong>Concise answer key:</strong> a strong claim names a user promise and the mechanism that protects it; Kafka needs explicit ordering, retention, replay, partition, and consumer semantics; ledger facts are source-of-truth, projections are derived durable state, and Redis is fast rebuildable serving state; Redis key age, projection update age, sink latency, checkpoint duration, and lag age separate likely causes; rollout review should ask about compatibility, canaries, rollback, and mixed-version behavior; resume defense should connect problem, mechanism, tradeoff, metrics, and recovery path.</p>
+        </div>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. Useful review questions here are: "What exactly is the claim?", "Where is the invariant enforced?", "What would falsify this?", "What signal proves it is healthy?", and "Who owns repair when it breaks?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://dataintensive.net/">Martin Kleppmann, <em>Designing Data-Intensive Applications</em></a></li>
+          <li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html">AWS Well-Architected Framework: Reliability Pillar</a></li>
+          <li><a href="https://sre.google/sre-book/service-level-objectives/">Google SRE Book: Service Level Objectives</a></li>
+          <li><a href="https://sre.google/sre-book/effective-troubleshooting/">Google SRE Book: Effective Troubleshooting</a></li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
