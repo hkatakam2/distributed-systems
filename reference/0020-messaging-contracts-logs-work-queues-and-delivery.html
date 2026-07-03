@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: Messaging Contracts</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0020</div>
+        <h1>Messaging Contracts</h1>
+        <p class="lede">A compact checklist for choosing between replayable event logs, routed work queues, and dual messaging designs without hiding the delivery and failure contract.</p>
+      </header>
+
+      <section>
+        <h2>Core Rule</h2>
+        <div class="principle">
+          <p><strong>Do not choose a broker first. Choose the message contract first.</strong></p>
+          <p>Name whether the message is durable history, pending work, a command, a notification, or a rebuildable projection update. Then choose the tool and controls that fit that contract.</p>
+        </div>
+      </section>
+
+      <section>
+        <h2>Contract Map</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Contract</th>
+              <th>Best mental model</th>
+              <th>Typical controls</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Event history</td>
+              <td>Something happened and may need replay by many consumers.</td>
+              <td>Kafka topic, partition key, retention, offsets, consumer groups, replay tools.</td>
+            </tr>
+            <tr>
+              <td>Pending work</td>
+              <td>Something must be processed by a worker and acknowledged.</td>
+              <td>RabbitMQ exchange, queue, binding, consumer ack, retry, dead-letter exchange.</td>
+            </tr>
+            <tr>
+              <td>Command</td>
+              <td>One system asks another to perform an action.</td>
+              <td>Idempotency key, authorization, timeout, retry budget, result tracking.</td>
+            </tr>
+            <tr>
+              <td>Notification</td>
+              <td>Consumers should learn about a change, but source truth lives elsewhere.</td>
+              <td>Stable event ID, version, dedupe, source lookup, missed-message repair.</td>
+            </tr>
+            <tr>
+              <td>Projection update</td>
+              <td>A read model must converge toward source truth.</td>
+              <td>Versioned upsert, freshness metadata, reconciliation, replay or rebuild.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Kafka Versus RabbitMQ</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Question</th>
+              <th>Kafka-shaped answer</th>
+              <th>RabbitMQ-shaped answer</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>What is stored?</td>
+              <td>Retained records in partitioned logs.</td>
+              <td>Messages waiting in queues for consumers.</td>
+            </tr>
+            <tr>
+              <td>How do consumers progress?</td>
+              <td>They advance and commit offsets.</td>
+              <td>They acknowledge deliveries.</td>
+            </tr>
+            <tr>
+              <td>How do many consumers share facts?</td>
+              <td>Separate consumer groups can read the same log independently.</td>
+              <td>Separate queues can receive routed copies through exchanges and bindings.</td>
+            </tr>
+            <tr>
+              <td>How do you replay?</td>
+              <td>Seek to earlier offsets or timestamps if retention allows.</td>
+              <td>Requeue, retry, or republish work; queues are not usually long-term history.</td>
+            </tr>
+            <tr>
+              <td>What is the ordering boundary?</td>
+              <td>Partition key and one consumer per partition in a group.</td>
+              <td>Queue order, affected by multiple consumers, redelivery, priority, and retry design.</td>
+            </tr>
+            <tr>
+              <td>What is failure ownership?</td>
+              <td>Consumer lag, retry topics, DLQs, offset policy, replay owner.</td>
+              <td>Unacked messages, redeliveries, dead-letter exchange, retry owner.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Dual Messaging Shape</h2>
+        <div class="map">
+          <pre><code>source transaction
+  -> update_id and source facts
+  -> outbox row
+  -> Kafka event history for replay and analytics
+  -> RabbitMQ routed work for explicit processing
+  -> idempotent consumers on both paths
+  -> reconciliation by update_id</code></pre>
+        </div>
+        <p>Use the same source update identity everywhere. Do not allow Kafka and RabbitMQ messages to invent different versions of the same business fact.</p>
+      </section>
+
+      <section>
+        <h2>Design Checklist</h2>
+        <ol>
+          <li>Name whether each message is history, work, command, notification, or projection update.</li>
+          <li>Choose the source of truth before choosing the broker.</li>
+          <li>Assign a stable message or update ID at the source boundary.</li>
+          <li>Choose the ordering key around the smallest entity that needs sequential state.</li>
+          <li>Publish durably and record publisher failures.</li>
+          <li>Acknowledge or commit only after durable, idempotent processing.</li>
+          <li>Bound retries and route poison messages to an owned dead-letter path.</li>
+          <li>Track backlog age, lag, unacked messages, redelivery, DLQ rate, and processing latency.</li>
+          <li>Measure end-to-end business freshness, not only broker health.</li>
+          <li>Reconcile source facts against processed outputs and repair missing update IDs.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Failure Matrix</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Failure</th>
+              <th>Likely cause</th>
+              <th>Control</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Message published to one path but not the other.</td>
+              <td>Dual write without outbox or reconciliation.</td>
+              <td>Single source fact, outbox publication, update-ID audit.</td>
+            </tr>
+            <tr>
+              <td>Duplicate update changes inventory twice.</td>
+              <td>At-least-once redelivery with non-idempotent handler.</td>
+              <td>Dedupe by update ID and versioned upsert.</td>
+            </tr>
+            <tr>
+              <td>Old update overwrites newer stock value.</td>
+              <td>Out-of-order delivery or retry.</td>
+              <td>Per-SKU sequence, event time, or source version guard.</td>
+            </tr>
+            <tr>
+              <td>One bad message blocks useful work.</td>
+              <td>Poison message retries forever in hot queue.</td>
+              <td>Bounded retries, dead-letter exchange, owner and repair tool.</td>
+            </tr>
+            <tr>
+              <td>Broker dashboard is green but inventory is stale.</td>
+              <td>Monitoring component health instead of business freshness.</td>
+              <td>Source-to-projection age by SKU and fulfillment center.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Operational Signals</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Layer</th>
+              <th>Signals</th>
+              <th>Question answered</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Kafka</td>
+              <td>Lag age, processing rate, partition skew, rebalance count.</td>
+              <td>Can stream consumers keep up with event history?</td>
+            </tr>
+            <tr>
+              <td>RabbitMQ</td>
+              <td>Ready messages, unacked messages, redelivery rate, confirm latency.</td>
+              <td>Is routed work being accepted, delivered, and completed?</td>
+            </tr>
+            <tr>
+              <td>Handlers</td>
+              <td>Processing latency, idempotency conflicts, retry count, failed side effects.</td>
+              <td>Are consumers safely applying updates?</td>
+            </tr>
+            <tr>
+              <td>Dead letters</td>
+              <td>DLQ rate, oldest dead letter age, failure reason, owner.</td>
+              <td>Is failed work visible and repairable?</td>
+            </tr>
+            <tr>
+              <td>Business output</td>
+              <td>Source-to-projection freshness, audit diffs, missing update IDs.</td>
+              <td>Did important updates reach the visible system state?</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Answer Shape</h2>
+        <div class="principle">
+          <p><strong>When defending a messaging design:</strong></p>
+          <ol>
+            <li>Start with the product promise and source of truth.</li>
+            <li>Classify each message as history, work, command, notification, or projection update.</li>
+            <li>Explain why the chosen broker contract fits that message.</li>
+            <li>Name the ordering key, replay or retry path, and acknowledgement point.</li>
+            <li>State the delivery semantics honestly, usually at-least-once plus idempotency.</li>
+            <li>Describe poison-message handling and ownership.</li>
+            <li>Close with freshness, lag, backlog, redelivery, DLQ, and reconciliation evidence.</li>
+          </ol>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
