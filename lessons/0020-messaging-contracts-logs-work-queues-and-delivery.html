@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0020: Messaging Contracts: Logs, Work Queues, and Delivery</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0020</div>
+        <h1>Messaging Contracts: Logs, Work Queues, and Delivery</h1>
+        <p class="lede">The twentieth mental model: messaging systems are not interchangeable pipes. A log, a queue, and a command channel make different promises about history, routing, replay, ordering, acknowledgement, and failure ownership.</p>
+        <p class="compact">Mission link: this is the production judgment behind replacing monolithic inventory polling with Kafka for high-throughput inventory streams and RabbitMQ-style queues for SKU update delivery across fulfillment centers.</p>
+      </header>
+
+      <section>
+        <h2>Where This Fits</h2>
+        <p><a href="0019-real-time-metrics-platform-design-drill.html">Lesson 0019</a> used Kafka and Flink for derived metrics. This lesson separates two messaging contracts that often get blurred: replayable event history and routed work delivery.</p>
+        <p>Keep <a href="../reference/0020-messaging-contracts-logs-work-queues-and-delivery.html">Reference 0020: Messaging Contracts</a> nearby. It is the compact checklist for choosing and defending the right messaging shape.</p>
+      </section>
+
+      <section>
+        <h2>Concise Answers From Lesson 0019</h2>
+        <ol>
+          <li><strong>Metric before topology:</strong> define what changes MRR or churn before debating partitions, operators, or Redis keys.</li>
+          <li><strong>Ordering is scoped:</strong> Kafka preserves order within a partition, so choose the key around the entity whose transitions must be sequential.</li>
+          <li><strong>Stream state is recoverable memory:</strong> checkpoints plus replay restore internal state, but external sinks still need idempotent or transactional behavior.</li>
+          <li><strong>Redis is a projection:</strong> it accelerates reads but should expose freshness metadata and remain rebuildable from source facts.</li>
+          <li><strong>Freshness and correctness differ:</strong> a pipeline can be fresh but wrong, or correct but too stale for the product promise.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>The Big Idea</h2>
+        <p>When someone says "we used Kafka and RabbitMQ," the senior answer is not a comparison chart of brand names. It is the delivery contract: which messages form a durable history, which messages represent pending work, who can replay, who owns failure, and what proof shows no important update was lost.</p>
+        <p><a href="https://kafka.apache.org/43/design/design/">Kafka's design documentation</a> frames Kafka around partitioned logs, retained records, consumer positions, and replay. <a href="https://www.rabbitmq.com/tutorials/amqp-concepts">RabbitMQ's AMQP model</a> frames delivery around publishers, exchanges, queues, bindings, routing keys, and consumers. <a href="https://www.rabbitmq.com/docs/confirms">RabbitMQ acknowledgements and publisher confirms</a> then define the handoff points between publisher, broker, and consumer.</p>
+        <div class="map">
+          <p><strong>Messaging contract questions:</strong></p>
+          <pre><code>is this durable event history or pending work?
+who needs to consume it, once or many times?
+what ordering boundary matters?
+when is a message safe to acknowledge?
+what happens after crash, retry, or poison message?
+what signal proves end-to-end delivery and freshness?</code></pre>
+        </div>
+        <p>The trap is treating "guaranteed delivery" as magic. In production, it usually means at-least-once delivery plus durable publishing, acknowledgements, idempotent handlers, dead-letter ownership, monitoring, and reconciliation.</p>
+      </section>
+
+      <section>
+        <h2>Scenario: Inventory Sync Across Fulfillment Centers</h2>
+        <p>Suppose each fulfillment center produces inventory changes for SKUs. The old system polls every few minutes and reconciles in bulk. The new requirement is faster sync, lower polling waste, and reliable processing of important SKU updates during peak sale traffic.</p>
+        <div class="flow">
+          <div><strong>Fact</strong>Stock changed for SKU and location.</div>
+          <div><strong>Log</strong>Kafka stores replayable inventory events.</div>
+          <div><strong>Queue</strong>RabbitMQ routes work to update workers.</div>
+          <div><strong>Apply</strong>Worker updates projection or downstream system.</div>
+          <div><strong>Prove</strong>Freshness, ack, lag, DLQ, audit.</div>
+        </div>
+        <p>A strong dual-messaging design starts with one source fact, one stable update ID, and two different uses of that fact. Kafka is useful when the company needs a replayable stream for projections, analytics, audits, and multiple subscribers. RabbitMQ is useful when a routed unit of work must be assigned, acknowledged, retried, or dead-lettered.</p>
+      </section>
+
+      <section>
+        <h2>History Versus Work</h2>
+        <p>Kafka and RabbitMQ can both move messages, but they encourage different reasoning. Kafka asks: "What happened, in what partitioned order, and where is each consumer in the log?" RabbitMQ asks: "Which queue should receive this work, which consumer has it, and was it acknowledged after processing?"</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Need</th>
+              <th>Log-shaped answer</th>
+              <th>Queue-shaped answer</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Many teams need the same facts.</td>
+              <td>Keep retained events in Kafka; each consumer group tracks its own position.</td>
+              <td>Use fanout routing only when each queue owns its copy of the work.</td>
+            </tr>
+            <tr>
+              <td>Rebuild a projection from old facts.</td>
+              <td>Replay the log from an offset or timestamp.</td>
+              <td>Queues usually represent pending work, not long-term replay history.</td>
+            </tr>
+            <tr>
+              <td>Distribute task execution.</td>
+              <td>Consumers in a group share partitions, but partition count and keys shape parallelism.</td>
+              <td>Competing consumers pull from a queue and acknowledge when work is done.</td>
+            </tr>
+            <tr>
+              <td>Route work by type or destination.</td>
+              <td>Use topics and keys, often with more explicit stream topology.</td>
+              <td>Use exchanges, bindings, and routing keys to route messages into queues.</td>
+            </tr>
+            <tr>
+              <td>Handle poison messages.</td>
+              <td>Use retry topics, DLQs, pause or skip policies, and replay ownership.</td>
+              <td>Use negative acknowledgements, retry queues, and dead-letter exchanges.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>The decision is not "Kafka is for scale, RabbitMQ is for reliability." Both can be reliable when configured and operated correctly. The real decision is whether the product needs replayable event history, routed pending work, or both.</p>
+      </section>
+
+      <section>
+        <h2>Design the Dual Path Without Split-Brain</h2>
+        <p>Dual messaging is powerful and dangerous. If one publisher writes to Kafka and another writes to RabbitMQ from a different source, the system can disagree about what happened. Keep one source fact and one update identity across both paths.</p>
+        <div class="map">
+          <p><strong>Safer inventory shape:</strong></p>
+          <pre><code>inventory transaction commits:
+  update_id = "sku_42:fc_9:seq_88401"
+  sku_id, fulfillment_center_id, quantity_delta, effective_time
+
+outbox publisher emits the same update_id to:
+  Kafka topic: inventory.stock-events
+  RabbitMQ exchange: inventory.sku-updates
+
+all consumers:
+  dedupe by update_id
+  apply idempotent side effects
+  report freshness and failures by update_id</code></pre>
+        </div>
+        <p>This makes Kafka and RabbitMQ two delivery views over the same fact, not two competing truths. If one path lags or fails, reconciliation can compare update IDs and repair the missing side.</p>
+      </section>
+
+      <section>
+        <h2>Handoff Points Decide Failure Behavior</h2>
+        <p>RabbitMQ's reliability story depends on explicit handoffs. Publisher confirms tell the publisher that the broker has accepted a message under the configured durability path. Consumer acknowledgements tell the broker that the consumer is done with a delivery and it can be removed from the queue. If a consumer crashes before acknowledgement, the broker can redeliver.</p>
+        <p>Kafka's consumer story is offset-based. A consumer processes records and commits its position. If it commits too early, a crash can lose work. If it commits after processing, a crash can cause reprocessing. That is why idempotent handlers matter in both systems.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Boundary</th>
+              <th>Weak habit</th>
+              <th>Stronger contract</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Publisher to broker</td>
+              <td>Fire and forget.</td>
+              <td>Use confirms, retry with idempotent message IDs, and alert on publish failures.</td>
+            </tr>
+            <tr>
+              <td>Broker to consumer</td>
+              <td>Acknowledge before side effects.</td>
+              <td>Acknowledge only after durable, idempotent processing completes.</td>
+            </tr>
+            <tr>
+              <td>Consumer to database</td>
+              <td>Blindly increment or overwrite.</td>
+              <td>Upsert by SKU and version or dedupe by update ID.</td>
+            </tr>
+            <tr>
+              <td>Retry to poison handling</td>
+              <td>Retry forever in the hot path.</td>
+              <td>Use bounded retries, dead-letter exchanges, ownership, and repair tools.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>The phrase "guaranteed SKU update delivery" should be translated into a defensible contract: important updates are durably published, delivered at least once, processed idempotently, retried under limits, dead-lettered with ownership, and audited against source facts.</p>
+      </section>
+
+      <section>
+        <h2>Ordering and Parallelism Are Tradeoffs</h2>
+        <p>Inventory systems usually need per-SKU or per-SKU-per-location ordering, not global ordering. Kafka makes that explicit through partition keys. RabbitMQ queues can preserve simple queue order, but multiple consumers, redeliveries, priorities, and retries can change the practical processing order. If a SKU cannot tolerate out-of-order updates, design the work key and handler around that fact.</p>
+        <div class="principle">
+          <p><strong>Useful rule:</strong> order the smallest entity that needs sequential state, then parallelize across independent entities.</p>
+          <p>For inventory, that often means serializing updates for one SKU at one fulfillment center while allowing different SKUs and locations to process independently.</p>
+        </div>
+        <p>If ordering is strict, include a monotonically increasing version or sequence in the message and reject stale updates. If ordering is soft, accept out-of-order delivery but make the projection converge by applying versioned upserts rather than blind deltas.</p>
+      </section>
+
+      <section>
+        <h2>Operate the Contract, Not the Broker Name</h2>
+        <p>Monitoring should match the promise. Kafka lag alone does not prove SKU sync is healthy. RabbitMQ queue depth alone does not prove important updates were applied. Watch the end-to-end age and correctness of the inventory view.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Concern</th>
+              <th>Useful signal</th>
+              <th>Decision it supports</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Kafka stream progress</td>
+              <td>Consumer lag age, processing rate, rebalance count, partition skew.</td>
+              <td>Scale consumers, fix hot keys, or reduce per-event work.</td>
+            </tr>
+            <tr>
+              <td>RabbitMQ delivery health</td>
+              <td>Ready messages, unacked messages, redeliveries, confirm latency.</td>
+              <td>Add workers, slow publishers, investigate stuck consumers.</td>
+            </tr>
+            <tr>
+              <td>Poison messages</td>
+              <td>Dead-letter count, retry age, failure reason, owner queue.</td>
+              <td>Repair data, patch handler, or replay affected updates.</td>
+            </tr>
+            <tr>
+              <td>SKU freshness</td>
+              <td>Age from source update to visible projection by SKU and location.</td>
+              <td>Page or degrade when the product promise is breached.</td>
+            </tr>
+            <tr>
+              <td>Correctness</td>
+              <td>Reconciliation diff between source facts, Kafka offsets, queue processing, and projection.</td>
+              <td>Find missing updates and prove repair completed.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Defend the Resume Bullet</h2>
+        <p>If someone asks how you replaced polling with Kafka and RabbitMQ, avoid saying "Kafka is fast and RabbitMQ is guaranteed." Explain the contracts and controls.</p>
+        <div class="principle">
+          <p><strong>Strong answer:</strong> "Polling was wasting work and adding sync latency, so we moved inventory changes to event-driven delivery. We kept a single source fact with a stable update ID. Kafka carried the high-throughput stock-event history for projections, analytics, replay, and multi-subscriber consumers. RabbitMQ carried routed SKU update work where workers needed explicit acknowledgement, retry, and dead-letter handling. We treated delivery as at-least-once, so handlers deduped by update ID and applied versioned idempotent writes. The main tradeoffs were ordering, retry pressure, and split-brain risk between paths, so we used one outbox source, bounded retries, dead-letter ownership, and reconciliation. We defended the change with source-to-projection freshness, Kafka lag age, queue depth, unacked messages, redelivery rate, DLQ rate, processing latency, and audit diffs."</p>
+        </div>
+        <p>That answer transfers beyond Kafka and RabbitMQ. The same judgment applies to Pub/Sub plus Cloud Tasks, Pulsar plus SQS, or any design that separates event history from pending work.</p>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. Which phrase best fits Kafka's role?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Kafka is usually strongest when you need partitioned, retained, replayable event history.">replayable event history</button>
+            <button data-correct="false" data-why="">exclusive worker mailbox</button>
+            <button data-correct="false" data-why="">local browser setting</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. Which phrase best fits RabbitMQ's role?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">global state truth</button>
+            <button data-correct="true" data-why="Correct. RabbitMQ is often used for routed work delivery through exchanges, queues, acknowledgements, retries, and dead letters.">routed work delivery</button>
+            <button data-correct="false" data-why="">silent cache mirror</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. What turns delivery into safety?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">unbounded retry loop</button>
+            <button data-correct="false" data-why="">hidden side effect</button>
+            <button data-correct="true" data-why="Correct. At-least-once delivery needs idempotent handlers so redelivery does not corrupt state.">idempotent handler design</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. Where should poison messages go?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Dead-letter exchanges make failed work visible and ownable instead of retrying forever in the hot path.">dead letter exchange</button>
+            <button data-correct="false" data-why="">main request path</button>
+            <button data-correct="false" data-why="">silent data hole</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>5. What proves the design works?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">diagram shape preference</button>
+            <button data-correct="true" data-why="Correct. The product cares whether source updates become visible within the promised freshness window.">update freshness evidence</button>
+            <button data-correct="false" data-why="">broker name matching</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required. These are the checks that show whether you can defend a messaging architecture rather than list middleware:</p>
+        <ol>
+          <li>Which inventory messages are durable facts, and which messages are pending work?</li>
+          <li>What stable update ID would let Kafka consumers, RabbitMQ workers, and reconciliation agree on the same fact?</li>
+          <li>When is it safe for a RabbitMQ consumer to acknowledge a SKU update?</li>
+          <li>When is it safe for a Kafka consumer to commit its offset?</li>
+          <li>How can "guaranteed delivery" still produce duplicate processing?</li>
+          <li>What signals prove inventory updates are fresh, processed, and repairable?</li>
+        </ol>
+        <div class="callout">
+          <p><strong>Concise answer key:</strong> durable facts are source inventory changes while pending work is the routed processing task; use one update ID from the source transaction or outbox; acknowledge or commit only after durable idempotent processing; at-least-once delivery can redeliver after crashes, lost acknowledgements, or retries; prove the system with end-to-end freshness, Kafka lag age, RabbitMQ ready and unacked counts, redelivery rate, DLQ rate, processing latency, idempotency conflicts, and reconciliation diffs.</p>
+        </div>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. Useful review questions here are: "Is this history or work?", "Who can replay?", "When do we acknowledge?", "What happens to poison messages?", and "What proves the update reached the visible inventory view?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://kafka.apache.org/43/design/design/">Apache Kafka Design Documentation</a></li>
+          <li><a href="https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html">Apache KafkaConsumer API Documentation</a></li>
+          <li><a href="https://www.rabbitmq.com/tutorials/amqp-concepts">RabbitMQ Documentation: AMQP 0-9-1 Model Explained</a></li>
+          <li><a href="https://www.rabbitmq.com/docs/confirms">RabbitMQ Documentation: Consumer Acknowledgements and Publisher Confirms</a></li>
+          <li><a href="https://www.rabbitmq.com/docs/reliability">RabbitMQ Documentation: Reliability and Data Safety</a></li>
+          <li><a href="https://www.rabbitmq.com/docs/dlx">RabbitMQ Documentation: Dead Letter Exchanges</a></li>
+        </ul>
+        <p>Recommended starting source: read RabbitMQ's AMQP model explanation first, then the acknowledgement and publisher-confirm guide.</p>
+      </section>
+    </main>
+  </body>
+</html>
