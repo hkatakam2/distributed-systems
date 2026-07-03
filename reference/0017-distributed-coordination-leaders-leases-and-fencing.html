@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: Distributed Coordination</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0017</div>
+        <h1>Distributed Coordination</h1>
+        <p class="lede">A compact checklist for leader election, leases, fencing tokens, ownership transfer, and safe side effects.</p>
+      </header>
+
+      <section>
+        <h2>Core Rule</h2>
+        <div class="principle">
+          <p><strong>Leader election chooses who may try. Fencing decides whose side effects are accepted.</strong></p>
+          <p>A lease without fencing can still allow an old holder to write late after a pause, network delay, or missed heartbeat. Correctness-sensitive resources must reject stale owners.</p>
+        </div>
+      </section>
+
+      <section>
+        <h2>Vocabulary</h2>
+        <p><strong>Consensus:</strong> agreement among machines on ordered decisions despite failures.</p>
+        <p><strong>Coordination service:</strong> a small, highly available control-plane system used for metadata, leader election, sessions, leases, and configuration.</p>
+        <p><strong>Leader election:</strong> a process by which candidates choose one current owner for a role.</p>
+        <p><strong>Session:</strong> a client relationship with a coordination service, usually maintained by heartbeats.</p>
+        <p><strong>Lease:</strong> time-bounded ownership that expires if it is not renewed.</p>
+        <p><strong>Fencing token:</strong> monotonically increasing ownership value included in side effects so stale owners can be rejected.</p>
+        <p><strong>Epoch or generation:</strong> another common name for an ownership term or monotonic version.</p>
+      </section>
+
+      <section>
+        <h2>Decision Table</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Problem</th>
+              <th>Likely primitive</th>
+              <th>Safety check</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>A duplicate task only wastes work.</td>
+              <td>Best-effort lock, idempotent work, or no lock.</td>
+              <td>Duplicates are harmless and bounded.</td>
+            </tr>
+            <tr>
+              <td>One process claims one database job row.</td>
+              <td>Atomic update, row lock, or transaction.</td>
+              <td>Claim is committed close to the data.</td>
+            </tr>
+            <tr>
+              <td>One owner runs long-lived control work.</td>
+              <td>Lease or session with heartbeat.</td>
+              <td>Every side effect carries a fencing token.</td>
+            </tr>
+            <tr>
+              <td>Machines must agree on ordered metadata decisions.</td>
+              <td>Consensus-backed service.</td>
+              <td>Majority-backed decision and durable log.</td>
+            </tr>
+            <tr>
+              <td>Stream partitions need assignment and failover.</td>
+              <td>Consumer group or shard lease.</td>
+              <td>Sink writes remain idempotent or fenced.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Safe Ownership Loop</h2>
+        <div class="map">
+          <pre><code>candidate starts
+  acquire lease or session
+  receive fencing token or epoch
+  publish current ownership state
+  perform work with token attached
+  downstream resource checks token
+  renew lease while healthy
+  stop work immediately if renewal fails
+  alert on churn, stale writes, and duplicate attempts</code></pre>
+        </div>
+      </section>
+
+      <section>
+        <h2>Fencing Pattern</h2>
+        <div class="map">
+          <pre><code>owner token = 8
+
+UPDATE projection_repair
+SET status = 'assigned',
+    owner_token = 8,
+    updated_at = now()
+WHERE repair_id = :repair_id
+  AND owner_token &lt; 8;
+
+if rows_updated == 0:
+  stop; a newer owner already acted</code></pre>
+        </div>
+        <p>The exact syntax changes by database or storage system. The invariant does not: stale tokens must fail at the resource being changed.</p>
+      </section>
+
+      <section>
+        <h2>Review Checklist</h2>
+        <ol>
+          <li>Is this lock for efficiency, scheduling, or correctness?</li>
+          <li>What exact invariant can a stale owner violate?</li>
+          <li>What grants ownership: database row, consumer group, lease, or consensus-backed election?</li>
+          <li>How does the system detect lost ownership?</li>
+          <li>Does every correctness-sensitive side effect include an epoch or fencing token?</li>
+          <li>Where is stale-token rejection enforced?</li>
+          <li>Can old and new owners overlap during failover, pause, or network delay?</li>
+          <li>Are duplicate actions idempotent, rejected, or repaired?</li>
+          <li>What metrics show leadership churn, renewal failures, stale writes, and duplicate attempts?</li>
+          <li>Who owns the runbook for stuck leases, repeated failover, and repair cleanup?</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Common Weak Claims</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Weak claim</th>
+              <th>Stronger version</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>"We use a distributed lock."</td>
+              <td>"A consensus-backed lease chooses the owner, and sinks reject stale fencing tokens."</td>
+            </tr>
+            <tr>
+              <td>"Only one pod runs the job."</td>
+              <td>"Only the newest ownership token can assign accepted work after failover."</td>
+            </tr>
+            <tr>
+              <td>"Kafka handles ownership."</td>
+              <td>"Consumer group assignment owns partitions; sink writes are still idempotent or fenced."</td>
+            </tr>
+            <tr>
+              <td>"The lock has a TTL."</td>
+              <td>"The lease expires for failover, and stale owners cannot write because resources check tokens."</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Answer Shape</h2>
+        <div class="principle">
+          <p><strong>When defending coordination:</strong></p>
+          <ol>
+            <li>Classify the risk: efficiency, scheduling, or correctness.</li>
+            <li>Name the owner and what it is allowed to do.</li>
+            <li>Name the coordination primitive and why it fits the control plane.</li>
+            <li>Describe the lease/session lifecycle and failover behavior.</li>
+            <li>Explain the fencing token and where stale tokens are rejected.</li>
+            <li>State the duplicate, pause, and network-delay failure modes.</li>
+            <li>Close with production evidence: churn, renewal failures, stale rejections, duplicate attempts, and repair success.</li>
+          </ol>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

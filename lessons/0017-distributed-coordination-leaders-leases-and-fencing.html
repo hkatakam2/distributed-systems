@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0017: Distributed Coordination, Leaders, Leases, and Fencing</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0017</div>
+        <h1>Distributed Coordination: Leaders, Leases, and Fencing</h1>
+        <p class="lede">The seventeenth mental model: coordination is not a magic lock. It is a correctness boundary for deciding who may act, for how long, and how stale actors are prevented from causing side effects.</p>
+        <p class="compact">Mission link: this is the missing layer behind safe repair jobs, shard ownership, stream processors, schedulers, rollout controllers, and any resume system that claims one active owner.</p>
+      </header>
+
+      <section>
+        <h2>Where This Fits</h2>
+        <p><a href="0016-production-architecture-review.html">Lesson 0016</a> taught how to review a production architecture as claims, failure modes, controls, evidence, and owners. This lesson focuses on one high-risk claim: "only one worker is allowed to do this right now."</p>
+        <p>Keep <a href="../reference/0017-distributed-coordination-leaders-leases-and-fencing.html">Reference 0017: Distributed Coordination</a> nearby. It is the compact checklist for leader election, leases, and fencing.</p>
+      </section>
+
+      <section>
+        <h2>Concise Answers From Lesson 0016</h2>
+        <ol>
+          <li><strong>Review claims, not boxes:</strong> a diagram becomes useful when each component supports a testable guarantee.</li>
+          <li><strong>Name the invariant:</strong> every important claim needs the condition that must remain true under retry, replay, failover, and rollout.</li>
+          <li><strong>Attach controls to failures:</strong> duplicate commands, stuck outbox rows, hot partitions, stale caches, unsafe schema changes, and runaway backfills each need a named control.</li>
+          <li><strong>Evidence matters:</strong> production readiness requires signals that distinguish likely causes, not just dashboards that prove a component exists.</li>
+          <li><strong>Strong defenses have shape:</strong> user promise, mechanism, tradeoff, metric, and recovery path.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>The Big Idea</h2>
+        <p>Distributed coordination is needed when independent processes must agree on a small piece of control-plane truth: who is leader, which worker owns a shard, whether a migration may start, or what command was chosen at a particular position in a replicated log.</p>
+        <p>The <a href="https://raft.github.io/">Raft consensus project</a> is the clean entry point for the consensus model: a cluster of machines agrees on ordered decisions despite machine failures. The <a href="https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/">Chubby paper</a> shows the production shape at Google: a highly available lock service used for coarse-grained coordination and low-volume metadata, not as a hot data path. <a href="https://zookeeper.apache.org/doc/current/recipes.html">ZooKeeper recipes</a> and the <a href="https://etcd.io/docs/v3.5/dev-guide/api_concurrency_reference_v3/">etcd concurrency API</a> show the same practical primitives: sessions or leases, ordered keys, locks, elections, and ownership checks.</p>
+        <div class="map">
+          <p><strong>Coordination loop:</strong></p>
+          <pre><code>need one actor
+  -> acquire session or lease
+  -> receive epoch or fencing token
+  -> perform side effects only if token is accepted
+  -> renew or lose ownership
+  -> expose churn, conflicts, and stale-token rejections</code></pre>
+        </div>
+        <p>The dangerous misunderstanding is thinking the lock itself prevents all harm. A lease can expire while the old holder is paused. The old holder can later wake up and try to write. That is why <a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">fencing tokens</a> matter: every new owner gets a higher token, and the downstream resource rejects writes from older tokens.</p>
+      </section>
+
+      <section>
+        <h2>Scenario: Projection Repair Coordinator</h2>
+        <p>Suppose your billing pipeline discovers bad derived revenue state for some merchants. You need a repair job that replays Kafka events into PostgreSQL projection tables and refreshes Redis serving keys. Multiple Kubernetes pods are running because you want failover, but only one coordinator should assign repair ranges at a time.</p>
+        <div class="flow">
+          <div><strong>Pods</strong>Several candidates can run.</div>
+          <div><strong>Lease</strong>One candidate owns coordination.</div>
+          <div><strong>Token</strong>Each ownership term has an epoch.</div>
+          <div><strong>Workers</strong>Ranges are processed idempotently.</div>
+          <div><strong>Sinks</strong>Writes reject stale tokens.</div>
+        </div>
+        <p>If the active coordinator crashes, another pod should take over. If the active coordinator pauses for 60 seconds and loses its lease, it must not later overwrite repair state assigned by the new coordinator. That second sentence is the part many designs miss.</p>
+      </section>
+
+      <section>
+        <h2>Step 1: Decide If Coordination Is Actually Needed</h2>
+        <p>First classify the risk. A cheap lock may be fine when duplicate work merely wastes CPU. It is not enough when duplicate work breaks a durable invariant or triggers external side effects.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Need</th>
+              <th>Example</th>
+              <th>Usual answer</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Efficiency only</td>
+              <td>Do not run the same cache warmer twice.</td>
+              <td>Best-effort lock or idempotent duplicate work is often acceptable.</td>
+            </tr>
+            <tr>
+              <td>Short critical section</td>
+              <td>Claim one pending job row.</td>
+              <td>Database transaction, row lock, or atomic update close to the data.</td>
+            </tr>
+            <tr>
+              <td>Long ownership</td>
+              <td>Own a stream shard, scheduler, or repair coordinator.</td>
+              <td>Lease or session with heartbeat, plus fencing on side effects.</td>
+            </tr>
+            <tr>
+              <td>Replicated decision</td>
+              <td>Choose the next command in a replicated metadata log.</td>
+              <td>Consensus-backed service such as etcd, ZooKeeper, or a Raft-based component.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>One strong heuristic: if a stale owner can corrupt state after it loses ownership, you need fencing or an equivalent invariant at the resource being modified.</p>
+      </section>
+
+      <section>
+        <h2>Step 2: Separate Lease From Fencing</h2>
+        <p>A lease answers "who currently appears to own this?" A fencing token answers "is this actor newer than the last actor this resource accepted?" Both are needed for long-running correctness-sensitive work.</p>
+        <div class="principle">
+          <p><strong>Lease:</strong> time-bounded ownership maintained by session, heartbeat, or TTL. It helps new owners take over when the old owner fails.</p>
+          <p><strong>Fencing token:</strong> monotonically increasing ownership number. Every side effect includes the token, and the resource rejects older tokens.</p>
+          <p><strong>Resource check:</strong> database row version, compare-and-set, conditional update, idempotency key, stream generation, or storage precondition that enforces the token.</p>
+        </div>
+        <div class="map">
+          <p><strong>Stale-owner failure:</strong></p>
+          <pre><code>coordinator A gets lease with token 7
+A pauses before writing repair assignment
+lease expires
+coordinator B gets lease with token 8
+B writes assignment with token 8
+A resumes and tries assignment with token 7
+projection_repair table rejects token 7</code></pre>
+        </div>
+        <p>Without the final rejection, the system merely hopes that lease timing and process scheduling line up. Hope is not a correctness mechanism.</p>
+      </section>
+
+      <section>
+        <h2>Step 3: Put Coordination in the Control Plane</h2>
+        <p>Coordination services are deliberately small and careful. Use them to decide ownership, store small metadata, elect leaders, or publish configuration versions. Do not use them as the high-throughput event stream, metrics store, or blob store.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Primitive</th>
+              <th>Good fit</th>
+              <th>Common mistake</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Kafka consumer group</td>
+              <td>Partition ownership and failover for stream consumption.</td>
+              <td>Treating it as proof that every downstream write is fenced.</td>
+            </tr>
+            <tr>
+              <td>PostgreSQL row claim</td>
+              <td>Claiming bounded jobs close to relational state.</td>
+              <td>Holding a transaction open around long external work.</td>
+            </tr>
+            <tr>
+              <td>etcd or ZooKeeper</td>
+              <td>Leader election, leases, ordered metadata, service coordination.</td>
+              <td>Putting hot business events or large payloads through the coordination path.</td>
+            </tr>
+            <tr>
+              <td>Redis lock</td>
+              <td>Reducing duplicate work when failure is tolerable.</td>
+              <td>Using lock ownership as the only guard for correctness-sensitive side effects.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Step 4: Make the Ownership Claim Reviewable</h2>
+        <p>Use the review loop from Lesson 0016. "We use leader election" is a tool statement. The production claim is more precise.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Review item</th>
+              <th>Projection repair answer</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Claim</td>
+              <td>At most one live coordinator can assign repair ranges accepted by sinks.</td>
+            </tr>
+            <tr>
+              <td>Mechanism</td>
+              <td>Consensus-backed lease grants ownership token; sinks use conditional writes.</td>
+            </tr>
+            <tr>
+              <td>Invariant</td>
+              <td>No sink accepts a write from a token lower than the latest accepted token for that repair job.</td>
+            </tr>
+            <tr>
+              <td>Failure mode</td>
+              <td>Old coordinator pauses, loses lease, resumes, and attempts stale writes.</td>
+            </tr>
+            <tr>
+              <td>Control</td>
+              <td>Fencing token on every repair assignment and projection write.</td>
+            </tr>
+            <tr>
+              <td>Evidence</td>
+              <td>Leadership churn, lease-renewal failures, stale-token rejection count, duplicate assignment attempts.</td>
+            </tr>
+            <tr>
+              <td>Owner</td>
+              <td>The team owning the repair controller also owns the lease runbook and stale-token alerts.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Step 5: Defend the Design</h2>
+        <p>When challenged, do not say "we used etcd so only one pod runs." That skips the actual safety argument.</p>
+        <div class="principle">
+          <p><strong>Weak answer:</strong> "We added a distributed lock so the repair job is safe."</p>
+          <p><strong>Strong answer:</strong> "The repair coordinator uses a consensus-backed lease for failover, but we do not rely on the lease alone. Each ownership term receives a monotonically increasing token. Every repair assignment and sink update includes that token, and PostgreSQL rejects stale tokens with conditional updates. If a coordinator pauses and resumes after losing ownership, its writes fail. We monitor lease churn, renewal failures, duplicate assignment attempts, and stale-token rejections."</p>
+        </div>
+        <p>The shape is the point: leader election chooses an owner, fencing protects the resource, and observability proves the ownership claim is holding.</p>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. What must protect correctness-sensitive side effects?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Fencing lets the resource reject stale owners instead of trusting lease timing.">monotonic fencing token</button>
+            <button data-correct="false" data-why="">decorative dashboard tile</button>
+            <button data-correct="false" data-why="">hopeful timeout value</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. What is consensus mainly for?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">compress JSON payloads</button>
+            <button data-correct="true" data-why="Correct. Consensus lets machines agree on ordered decisions despite failures.">agree ordered decisions</button>
+            <button data-correct="false" data-why="">format status pages</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. Why is a lease alone unsafe for long work?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">metrics look green</button>
+            <button data-correct="false" data-why="">tables have indexes</button>
+            <button data-correct="true" data-why="Correct. A holder can pause, lose the lease, resume, and attempt stale side effects.">work resumes late</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. Where should coordination services usually sit?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Coordination services are for careful ownership and metadata decisions, not hot data paths.">small control planes</button>
+            <button data-correct="false" data-why="">hot event streams</button>
+            <button data-correct="false" data-why="">bulk media storage</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>5. When is a cheap lock often acceptable?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">external money movement</button>
+            <button data-correct="true" data-why="Correct. If failure only creates harmless duplicate work, the lock is an efficiency tool.">duplicate work only</button>
+            <button data-correct="false" data-why="">shared invariant risk</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required. These are the checks that show whether you can defend coordination instead of naming a lock library:</p>
+        <ol>
+          <li>For a repair coordinator, what is the difference between the lease and the fencing token?</li>
+          <li>Why is "only one pod has the lock" not a complete correctness argument?</li>
+          <li>Where would you enforce stale-token rejection in a PostgreSQL-backed projection repair?</li>
+          <li>When would Kafka consumer group ownership be enough, and when would it not be enough?</li>
+          <li>What evidence would you want before trusting the coordination design in production?</li>
+        </ol>
+        <div class="callout">
+          <p><strong>Concise answer key:</strong> the lease grants temporary ownership while the fencing token proves freshness to downstream resources; a lock alone does not stop paused old owners from writing late; PostgreSQL should enforce token checks with conditional updates or versioned rows near the projection state; consumer group ownership is enough for partition assignment but not for unfenced external side effects; production evidence should include leadership churn, renewal failures, stale-token rejections, duplicate attempts, and repair success rate.</p>
+        </div>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. Useful review questions here are: "What is the invariant?", "What happens if the old leader resumes?", "Which resource enforces the token?", and "Is this coordination for correctness or just efficiency?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://raft.github.io/">Raft consensus project and paper links</a></li>
+          <li><a href="https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/">Google Research: The Chubby lock service</a></li>
+          <li><a href="https://zookeeper.apache.org/doc/current/recipes.html">Apache ZooKeeper: Recipes and Solutions</a></li>
+          <li><a href="https://etcd.io/docs/v3.5/dev-guide/api_concurrency_reference_v3/">etcd API: concurrency reference</a></li>
+          <li><a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">Martin Kleppmann: How to do distributed locking</a></li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
