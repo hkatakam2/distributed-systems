@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reference: RAG Pipelines</title>
+    <link rel="stylesheet" href="../assets/course.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Reference 0018</div>
+        <h1>RAG Pipelines</h1>
+        <p class="lede">A compact checklist for designing, evaluating, and defending retrieval-augmented generation systems as production pipelines.</p>
+      </header>
+
+      <section>
+        <h2>Core Rule</h2>
+        <div class="principle">
+          <p><strong>A RAG system has two promises: retrieve the right evidence, then answer only within that evidence.</strong></p>
+          <p>RAG can make model outputs more grounded and easier to update, but retrieval does not automatically make an answer true. Corpus authority, chunking, metadata, generation instructions, evals, and observability all carry part of the reliability contract.</p>
+        </div>
+      </section>
+
+      <section>
+        <h2>Vocabulary</h2>
+        <p><strong>Corpus:</strong> the documents, tickets, logs, runbooks, or records the system may retrieve from.</p>
+        <p><strong>Chunk:</strong> a retrievable slice of source material with enough local context to be useful.</p>
+        <p><strong>Embedding:</strong> a vector representation used to compare semantic relatedness between text.</p>
+        <p><strong>Vector index:</strong> searchable storage for embeddings plus source text and metadata.</p>
+        <p><strong>Semantic search:</strong> retrieval by meaning, not only exact keyword overlap.</p>
+        <p><strong>Metadata filter:</strong> a constraint such as product area, version, date, tenant, permission, or source type applied before or during retrieval.</p>
+        <p><strong>Reranker:</strong> a second-stage ranker that reorders candidate chunks using a more precise relevance model.</p>
+        <p><strong>Grounding:</strong> tying generated claims to retrieved source evidence.</p>
+        <p><strong>Faithfulness:</strong> whether the answer's claims are supported by the retrieved context.</p>
+        <p><strong>Precision@k:</strong> the share of the top k retrieved chunks that are relevant.</p>
+      </section>
+
+      <section>
+        <h2>Production Pipeline</h2>
+        <div class="map">
+          <pre><code>source systems
+  -> normalize and redact
+  -> chunk with source metadata
+  -> embed and index
+  -> retrieve candidates
+  -> filter and rerank
+  -> synthesize grounded answer
+  -> cite source evidence
+  -> evaluate retrieval and generation
+  -> monitor latency, cost, failures, freshness</code></pre>
+        </div>
+      </section>
+
+      <section>
+        <h2>Corpus Contract</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Source</th>
+              <th>Authority</th>
+              <th>Control</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>API docs</td>
+              <td>High for intended public behavior.</td>
+              <td>Version, product area, endpoint, release date.</td>
+            </tr>
+            <tr>
+              <td>Support tickets</td>
+              <td>Useful symptoms, not canonical policy.</td>
+              <td>Resolution status, age, product, sensitive-data redaction.</td>
+            </tr>
+            <tr>
+              <td>Integration logs</td>
+              <td>Concrete evidence for one case.</td>
+              <td>Tenant permission, retention, trace ID, time window.</td>
+            </tr>
+            <tr>
+              <td>Runbooks</td>
+              <td>Operational procedure if current.</td>
+              <td>Owner, last reviewed date, incident scope.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Design Checklist</h2>
+        <ol>
+          <li>What user question is the system allowed to answer?</li>
+          <li>Which sources are authoritative, anecdotal, stale, private, or case-specific?</li>
+          <li>What metadata must travel with every chunk?</li>
+          <li>How are documents versioned, redacted, indexed, deleted, and reindexed?</li>
+          <li>Does retrieval need keyword search, semantic search, hybrid search, reranking, or filters?</li>
+          <li>Can the generator say "not enough evidence" instead of guessing?</li>
+          <li>Are answers required to cite source IDs, document versions, or trace IDs?</li>
+          <li>Which evals separate retrieval failure from generation failure?</li>
+          <li>What production metrics show freshness, relevance, latency, cost, errors, and user corrections?</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Evaluation Matrix</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>Question</th>
+              <th>Common fix</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Precision@5</td>
+              <td>Are the top five chunks mostly useful?</td>
+              <td>Improve chunking, filters, ranking, or corpus hygiene.</td>
+            </tr>
+            <tr>
+              <td>Context recall</td>
+              <td>Did retrieval include the needed evidence somewhere?</td>
+              <td>Change chunk size, query expansion, hybrid search, or top-k.</td>
+            </tr>
+            <tr>
+              <td>Faithfulness</td>
+              <td>Are generated claims supported by retrieved context?</td>
+              <td>Tighten answer contract, citations, abstention, and judge prompts.</td>
+            </tr>
+            <tr>
+              <td>Answer relevance</td>
+              <td>Did the final answer solve the user's task?</td>
+              <td>Improve prompt framing, reranking, synthesis, or task routing.</td>
+            </tr>
+            <tr>
+              <td>Serving health</td>
+              <td>Is the system fast, fresh, affordable, and observable?</td>
+              <td>Add SLOs, budgets, tracing, caching, queue controls, and alerts.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Failure Modes</h2>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Failure</th>
+              <th>Likely cause</th>
+              <th>Control</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Correct doc missing from results.</td>
+              <td>Bad chunking, weak query, missing metadata, indexing lag.</td>
+              <td>Retrieval evals, freshness checks, hybrid retrieval, reranking.</td>
+            </tr>
+            <tr>
+              <td>Old ticket outranks current docs.</td>
+              <td>No authority model or source weighting.</td>
+              <td>Source hierarchy, date filters, version metadata.</td>
+            </tr>
+            <tr>
+              <td>Answer leaks private case data.</td>
+              <td>Missing permission filter or redaction.</td>
+              <td>Access checks before retrieval, tenant filters, PII scrubbing.</td>
+            </tr>
+            <tr>
+              <td>Answer sounds right but is unsupported.</td>
+              <td>Generator fills gaps from model memory.</td>
+              <td>Faithfulness eval, citation requirement, abstention behavior.</td>
+            </tr>
+            <tr>
+              <td>Quality drops after corpus update.</td>
+              <td>Ingestion changed retrieval distribution.</td>
+              <td>Regression eval suite, canary index, rollback path.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Answer Shape</h2>
+        <div class="principle">
+          <p><strong>When defending a RAG pipeline:</strong></p>
+          <ol>
+            <li>Name the user task and allowed corpus.</li>
+            <li>Classify sources by authority, freshness, and permissions.</li>
+            <li>Describe ingestion: normalize, redact, chunk, embed, index, version.</li>
+            <li>Describe retrieval: filters, top-k, reranking, and source weighting.</li>
+            <li>Describe generation: grounded answer contract, citations, abstention.</li>
+            <li>Separate evals: retrieval quality, faithfulness, answer relevance, latency, cost.</li>
+            <li>Close with production controls: tracing, dashboards, regression tests, index rollback, and owner.</li>
+          </ol>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

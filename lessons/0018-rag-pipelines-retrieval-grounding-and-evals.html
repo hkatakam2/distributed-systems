@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lesson 0018: RAG Pipelines, Retrieval, Grounding, and Evals</title>
+    <link rel="stylesheet" href="../assets/course.css">
+    <script defer src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">Lesson 0018</div>
+        <h1>RAG Pipelines: Retrieval, Grounding, and Evals</h1>
+        <p class="lede">The eighteenth mental model: a RAG system is not a prompt trick. It is a production pipeline that must retrieve the right evidence, constrain generation to that evidence, and prove quality with stage-specific evals.</p>
+        <p class="compact">Mission link: this is the judgment behind defending a RAG pipeline over API docs, support tickets, and integration logs with precision@5 and faithfulness evals.</p>
+      </header>
+
+      <section>
+        <h2>Where This Fits</h2>
+        <p><a href="0017-distributed-coordination-leaders-leases-and-fencing.html">Lesson 0017</a> handled ownership and fencing. This lesson zooms back out into AI infrastructure: RAG combines ingestion, storage, retrieval, generation, evaluation, observability, privacy, and operations.</p>
+        <p>Keep <a href="../reference/0018-rag-pipelines-retrieval-grounding-and-evals.html">Reference 0018: RAG Pipelines</a> nearby. It is the compact checklist for turning a resume AI bullet into a defensible system design.</p>
+      </section>
+
+      <section>
+        <h2>Concise Answers From Lesson 0017</h2>
+        <ol>
+          <li><strong>Lease versus token:</strong> a lease grants temporary ownership; a fencing token lets downstream resources reject stale owners.</li>
+          <li><strong>Lock is not enough:</strong> a paused holder can lose ownership, wake up late, and still attempt harmful side effects.</li>
+          <li><strong>Enforce near the resource:</strong> PostgreSQL can reject stale tokens with conditional updates or versioned rows.</li>
+          <li><strong>Consumer group scope:</strong> Kafka assigns partition ownership, but external side effects still need idempotency or fencing.</li>
+          <li><strong>Evidence matters:</strong> watch leadership churn, renewal failures, stale-token rejections, duplicate attempts, and repair success.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>The Big Idea</h2>
+        <p>The original <a href="https://arxiv.org/abs/2005.11401">RAG paper</a> frames retrieval-augmented generation as combining a language model's internal knowledge with explicit external memory retrieved at inference time. In production, that idea becomes two connected pipelines: an ingestion pipeline that turns trusted sources into searchable evidence, and a query pipeline that retrieves, ranks, and uses that evidence to answer.</p>
+        <p>OpenAI's <a href="https://platform.openai.com/docs/guides/embeddings">embedding docs</a> describe embeddings as vectors whose distances measure relatedness between texts, and the <a href="https://developers.openai.com/api/docs/guides/retrieval">retrieval docs</a> show the practical serving shape: semantic search over vector stores, with chunks, metadata, scoring, and synthesis. The production lesson is broader than any one vendor: retrieval is a serving path with correctness, latency, freshness, privacy, and rollback concerns.</p>
+        <div class="map">
+          <p><strong>RAG path:</strong></p>
+          <pre><code>docs, tickets, logs, runbooks
+  -> normalize, redact, chunk
+  -> embed, index, version
+  -> retrieve candidates
+  -> filter and rerank
+  -> synthesize grounded answer
+  -> cite evidence
+  -> evaluate retrieval and generation separately</code></pre>
+        </div>
+        <p>The trap is treating "we added vector search" as the whole design. Vector search may return plausible context, but plausible context is not the same as authoritative context, current context, permitted context, or sufficient context.</p>
+      </section>
+
+      <section>
+        <h2>Scenario: Billing Integration Debugger</h2>
+        <p>Suppose you build an internal assistant for billing integration debugging. It can search API docs, resolved support tickets, and integration logs. Engineers ask questions such as "Why is this subscription update failing after migration?" or "Which retry strategy worked for this payment error pattern?"</p>
+        <div class="flow">
+          <div><strong>Sources</strong>Docs, tickets, logs.</div>
+          <div><strong>Index</strong>Chunks, embeddings, metadata.</div>
+          <div><strong>Retrieve</strong>Filters, top-k, rerank.</div>
+          <div><strong>Answer</strong>Grounded synthesis, citations.</div>
+          <div><strong>Evals</strong>Precision, faithfulness, relevance.</div>
+        </div>
+        <p>This looks like an AI feature, but it is also a distributed systems feature. Data arrives from several owners, indexing is asynchronous, queries need authorization, latency has a budget, answers must be observable, and quality can regress after corpus changes.</p>
+      </section>
+
+      <section>
+        <h2>Step 1: Design the Corpus Contract</h2>
+        <p>Before chunk size or model choice, decide what each source is allowed to prove. The system should not treat a three-year-old support workaround as equal to the current API docs, and it should not retrieve another customer's logs just because the text is similar.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Source</th>
+              <th>What it proves</th>
+              <th>Required metadata</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>API docs</td>
+              <td>Canonical behavior for a versioned public contract.</td>
+              <td>Endpoint, version, product area, release date, owner.</td>
+            </tr>
+            <tr>
+              <td>Support tickets</td>
+              <td>Real symptoms, historical fixes, and edge cases.</td>
+              <td>Status, resolution, age, product, sensitivity label.</td>
+            </tr>
+            <tr>
+              <td>Integration logs</td>
+              <td>Observed facts for a specific request, tenant, and time window.</td>
+              <td>Tenant, trace ID, timestamp, retention, access scope.</td>
+            </tr>
+            <tr>
+              <td>Runbooks</td>
+              <td>Operational procedure if reviewed and current.</td>
+              <td>Owner, last reviewed date, incident class, rollback path.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>That table is a production control. It tells retrieval which chunks may compete, which must be filtered, which should be weighted, and which should be cited as authoritative versus anecdotal.</p>
+      </section>
+
+      <section>
+        <h2>Step 2: Treat Retrieval as a Serving Path</h2>
+        <p>Retrieval has its own failure modes. Chunks can be too small to preserve meaning or too large to rank cleanly. Metadata can be missing. Indexing can lag. Deletions can be eventually consistent. A high-similarity chunk can still be the wrong authority.</p>
+        <div class="principle">
+          <p><strong>Good retrieval design:</strong> chunk by user task, attach source metadata, filter by permissions and version, retrieve more candidates than you show, rerank when precision matters, and record which chunk IDs influenced the answer.</p>
+          <p><strong>Weak retrieval design:</strong> dump every document into a vector store, use default top-k forever, and only measure whether the final answer feels reasonable.</p>
+        </div>
+        <p>OpenAI's retrieval guide notes that vector-store files may be processed asynchronously and that removed files can briefly appear in search results after deletion. Whether or not you use that exact API, the lesson transfers: indexing state, source version, and deletion behavior are part of your system contract.</p>
+      </section>
+
+      <section>
+        <h2>Step 3: Constrain the Generator</h2>
+        <p>The model should not be asked to "be helpful" in a vacuum. It needs an answer contract: use the retrieved context, distinguish authoritative docs from historical tickets, cite source IDs, and say when evidence is missing.</p>
+        <div class="map">
+          <p><strong>Answer contract:</strong></p>
+          <pre><code>Answer from retrieved sources only.
+Prefer current API docs over old support tickets.
+Use logs only for the tenant and trace IDs allowed by this request.
+If the retrieved context is insufficient, say what evidence is missing.
+Cite document IDs, ticket IDs, or trace IDs for operational follow-up.</code></pre>
+        </div>
+        <p>Grounding is not just a prompt instruction. The system should log retrieval inputs, selected chunks, source versions, model output, citations, user feedback, and eval outcomes so a bad answer can be debugged like any other production failure.</p>
+      </section>
+
+      <section>
+        <h2>Step 4: Measure the Split</h2>
+        <p><a href="https://arxiv.org/abs/2309.15217">Ragas</a> and <a href="https://arxiv.org/abs/2311.09476">ARES</a> both separate RAG evaluation into multiple dimensions. That split is the key engineering habit: do not collapse retrieval, grounding, and usefulness into one vague "accuracy" number.</p>
+        <table class="tradeoff">
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>What it catches</th>
+              <th>Likely repair</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Precision@5</td>
+              <td>Top chunks are noisy, stale, or irrelevant.</td>
+              <td>Better chunking, filters, source weights, reranking.</td>
+            </tr>
+            <tr>
+              <td>Context recall</td>
+              <td>Needed evidence is absent from retrieved context.</td>
+              <td>Hybrid search, query expansion, more top-k, corpus repair.</td>
+            </tr>
+            <tr>
+              <td>Faithfulness</td>
+              <td>Answer includes unsupported or contradicted claims.</td>
+              <td>Tighter answer contract, citations, abstention, judge review.</td>
+            </tr>
+            <tr>
+              <td>Answer relevance</td>
+              <td>Answer is grounded but does not solve the user task.</td>
+              <td>Improve task routing, prompt structure, or synthesis examples.</td>
+            </tr>
+            <tr>
+              <td>Serving health</td>
+              <td>Quality is fine offline, but production is slow or stale.</td>
+              <td>SLOs, tracing, cache policy, index freshness alerts, cost budgets.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>A resume claim like "&gt; 0.85 accuracy through precision@5 and faithfulness evals" becomes defensible only if you can explain the eval set, the labels or judges, the failure cases, and how the metric changed system behavior.</p>
+      </section>
+
+      <section>
+        <h2>Step 5: Defend the Design</h2>
+        <p>When challenged, avoid saying "we used LangChain and Pinecone." That names tools, not the production argument.</p>
+        <div class="principle">
+          <p><strong>Weak answer:</strong> "We built a RAG bot over docs and tickets."</p>
+          <p><strong>Strong answer:</strong> "We treated the assistant as a retrieval pipeline. API docs, resolved tickets, and integration logs were classified by authority, freshness, and permissions before indexing. Each chunk carried version, product, source, tenant, and sensitivity metadata. Retrieval used filters and reranking so current docs outranked old anecdotes, while the generator had to cite source IDs and abstain when evidence was missing. We evaluated retrieval with precision@5, generation with faithfulness and answer relevance, and production health with latency, token cost, index freshness, and user correction signals."</p>
+        </div>
+        <p>The shape is the point: corpus contract, retrieval controls, grounded generation, separate evals, and operational evidence.</p>
+      </section>
+
+      <section>
+        <h2>Retrieval Practice</h2>
+        <p>Answer from memory first. Then click to check.</p>
+
+        <div class="quiz">
+          <h3>1. What comes before chunk size?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Source authority, freshness, and permissions define what retrieval is allowed to prove.">corpus authority map</button>
+            <button data-correct="false" data-why="">bigger prompt text</button>
+            <button data-correct="false" data-why="">random chunk size</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>2. What does precision@5 inspect?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">model token count</button>
+            <button data-correct="true" data-why="Correct. Precision@5 asks how many of the top five retrieved chunks are relevant.">top chunks relevance</button>
+            <button data-correct="false" data-why="">database index bloat</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>3. What should insufficient context trigger?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">invent likely answer</button>
+            <button data-correct="false" data-why="">hide source ids</button>
+            <button data-correct="true" data-why="Correct. A grounded system should say what evidence is missing instead of filling the gap.">say evidence missing</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>4. Why attach metadata to chunks?</h3>
+          <div class="quiz-options">
+            <button data-correct="true" data-why="Correct. Metadata lets retrieval filter by authority, version, tenant, date, and permissions.">filter trusted context</button>
+            <button data-correct="false" data-why="">inflate storage bills</button>
+            <button data-correct="false" data-why="">decorate log lines</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+
+        <div class="quiz">
+          <h3>5. Which metric checks unsupported claims?</h3>
+          <div class="quiz-options">
+            <button data-correct="false" data-why="">pod restart count</button>
+            <button data-correct="true" data-why="Correct. Faithfulness checks whether generated claims are supported by retrieved context.">answer faithfulness score</button>
+            <button data-correct="false" data-why="">schema migration lock</button>
+          </div>
+          <div class="feedback" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Reflection Questions</h2>
+        <p>No homework is required. These are the checks that show whether you can defend RAG as infrastructure instead of naming an AI framework:</p>
+        <ol>
+          <li>Why is "we indexed docs in a vector database" not enough to prove answer quality?</li>
+          <li>What metadata would you attach to API docs, support tickets, and integration logs?</li>
+          <li>How do precision@5 and faithfulness catch different failure modes?</li>
+          <li>When should the assistant refuse to answer or ask for more evidence?</li>
+          <li>What production signals would you watch after a large corpus update?</li>
+        </ol>
+        <div class="callout">
+          <p><strong>Concise answer key:</strong> vector indexing only creates candidates, not authority or grounding; useful metadata includes source type, version, product area, date, tenant, trace ID, permission scope, owner, and sensitivity; precision@5 catches bad retrieved chunks while faithfulness catches unsupported generated claims; the assistant should abstain when evidence is missing, stale, unauthorized, or contradictory; production signals include index freshness, retrieval relevance, answer feedback, latency, cost, error rate, token usage, and quality-regression evals.</p>
+        </div>
+        <div class="callout">
+          <p>Ask follow-up questions about any unclear piece. Useful review questions here are: "What can this source prove?", "What did retrieval miss?", "Which claim lacks evidence?", and "Which eval would catch this regression?"</p>
+        </div>
+      </section>
+
+      <section class="footnotes">
+        <h2>Primary Sources</h2>
+        <ul>
+          <li><a href="https://arxiv.org/abs/2005.11401">Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks</a></li>
+          <li><a href="https://platform.openai.com/docs/guides/embeddings">OpenAI Documentation: Vector embeddings</a></li>
+          <li><a href="https://developers.openai.com/api/docs/guides/retrieval">OpenAI Documentation: Retrieval</a></li>
+          <li><a href="https://arxiv.org/abs/2309.15217">Ragas: Automated Evaluation of Retrieval Augmented Generation</a></li>
+          <li><a href="https://arxiv.org/abs/2311.09476">ARES: An Automated Evaluation Framework for Retrieval-Augmented Generation Systems</a></li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
